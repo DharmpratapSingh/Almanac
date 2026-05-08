@@ -147,14 +147,22 @@
   <script type="text/babel" src="scene.jsx"></script>
   <script type="text/babel" src="dayinweather.jsx"></script>
   <script type="text/babel" src="page.jsx"></script>
+
+  <!-- Vercel Web Analytics & Speed Insights (vanilla / no-framework setup).
+       The inline stubs queue events that fire before the deferred scripts
+       finish loading; without them, the Real Experience Score won't populate.
+       The /_vercel/* paths are auto-served by Vercel's edge in production;
+       on localhost they 404 silently and the inline stubs become no-ops. -->
+  <script>
+    window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+  </script>
+  <script defer src="/_vercel/insights/script.js"></script>
+  <script>
+    window.si = window.si || function () { (window.siq = window.siq || []).push(arguments); };
+  </script>
+  <script defer src="/_vercel/speed-insights/script.js"></script>
 </head>
 <body>
   <div id="root"></div>
-
-  <!-- Vercel Web Analytics & Speed Insights.
-       These paths are auto-served by Vercel's edge in production;
-       on localhost they 404 silently and are no-ops. -->
-  <script defer src="/_vercel/insights/script.js"></script>
-  <script defer src="/_vercel/speed-insights/script.js"></script>
 </body>
 </html>
