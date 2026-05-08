@@ -1,0 +1,7 @@
+# local-only files — don't ship these to Vercel
+*.zip
+*.log
+.claude/
+.DS_Store
+.git/
+.gitignore
