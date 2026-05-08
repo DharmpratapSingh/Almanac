@@ -90,8 +90,15 @@
     .stat-block { transition: transform .15s; }
     .stat-block:hover { transform: translate(-1px,-1px); }
 
+    /* Mode switcher (DAY IN WEATHER) buttons — let columns shrink past
+       min-content so long labels never force horizontal page overflow. */
+    .dw-mode-switcher button { min-width: 0; }
+    .dw-mode-switcher button > div { min-width: 0; }
+    .dw-mode-switcher button span { min-width: 0; overflow-wrap: anywhere; }
+
     /* ─── RESPONSIVE ─── */
     @media (max-width: 900px) {
+      .dw-mode-switcher { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
       .dw-story-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
       .grid-broadsheet { grid-template-columns: 1fr !important; gap: 18px !important; }
       .grid-hero { grid-template-columns: 1fr !important; gap: 12px !important; text-align: center; }
@@ -110,7 +117,7 @@
       .col-2 { column-count: 1 !important; }
       .grid-fivedays { grid-template-columns: repeat(3, 1fr) !important; row-gap: 12px; }
       .almtable td { font-size: 16px !important; }
-      h1.masthead-title { font-size: clamp(40px, 12vw, 88px) !important; letter-spacing: 2px !important; }
+      h1.masthead-title { font-size: clamp(32px, 10vw, 72px) !important; letter-spacing: 2px !important; }
       h1.hero-temp { font-size: clamp(120px, 38vw, 220px) !important; }
       .pad-section { padding-left: 14px !important; padding-right: 14px !important; }
       .ticker { font-size: 14px !important; }
@@ -118,6 +125,8 @@
       .toggle-bar--floating { top: 8px !important; right: 8px !important; }
     }
     @media (max-width: 560px) {
+      h1.masthead-title { font-size: clamp(22px, 7vw, 40px) !important; letter-spacing: 1px !important; }
+      .dw-mode-switcher { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 6px !important; }
       .grid-instruments-1, .grid-instruments-2 { grid-template-columns: 1fr !important; }
       .grid-instruments-1 > div, .grid-instruments-2 > div {
         border-right: none !important;
