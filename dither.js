@@ -11,7 +11,7 @@
 (function () {
   const PAPER = '#f3ecd9';
   const INK   = '#1a1612';
-  const RUST  = '#c25a3a';
+  const RUST  = '#7a2f3a';
   const SLATE = '#5a6b76';
 
   // Mutable theme state.

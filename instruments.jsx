@@ -225,7 +225,7 @@ function Hygrometer({ s }) {
     }
   }, [h]);
   return (<Card fig="E" title="HYGROMETER" sub="Moisture in the air"
-    foot={<><span style={{color:'var(--slate)'}}>DEW</span><span style={{color:'var(--rust)'}}>{dew}°</span></>}>
+    foot={<><span style={{color:'var(--slate)'}}>DEW</span><span style={{color:'var(--rust)'}}>{window.formatT(dew)}</span></>}>
     <div style={{ display:'flex', alignItems:'center', gap: 8 }}>
       <canvas ref={ref} style={{ imageRendering:'pixelated', width: 180, height: 180 }} />
       <div style={{ fontFamily:'"VT323",monospace', fontSize: 56, color:'var(--rust)', lineHeight: 1 }}>{h}%</div>
@@ -268,10 +268,10 @@ function Wardrobe({ s }) {
   const t = s.current.temp;
   const wmo = s.current.wmo || {};
   let out = 'T-SHIRT'; let acc = '';
-  if (t < 0)  { out = 'PARKA'; acc = '+ MITTENS, BOOTS'; }
-  else if (t < 10) { out = 'COAT'; acc = '+ SCARF'; }
-  else if (t < 18) { out = 'SWEATER'; acc = '+ JEANS'; }
-  else if (t < 26) { out = 'SHIRT'; acc = '+ SHORTS'; }
+  if (t < 32) { out = 'PARKA'; acc = '+ MITTENS, BOOTS'; }
+  else if (t < 50) { out = 'COAT'; acc = '+ SCARF'; }
+  else if (t < 65) { out = 'SWEATER'; acc = '+ JEANS'; }
+  else if (t < 78) { out = 'SHIRT'; acc = '+ SHORTS'; }
   else { out = 'TANK'; acc = '+ SUNHAT'; }
   if (wmo.icon === 'rain' || wmo.icon === 'storm') acc += ' + UMBRELLA';
   if (wmo.icon === 'snow') acc += ' + BOOTS';
@@ -301,18 +301,18 @@ function Wardrobe({ s }) {
     // shoes
     D3.pxRect(c, 16, 46, 4, 2); D3.pxRect(c, 21, 46, 4, 2);
     // hat for cold
-    if (t < 10) {
+    if (t < 50) {
       for (let xx = -6; xx <= 6; xx++) D3.px(c, 20 + xx, 7, D3.getAccent());
       for (let yy = 0; yy < 4; yy++) for (let xx = -4; xx <= 4; xx++)
         D3.px(c, 20 + xx, 3 + yy, D3.getAccent());
-    } else if (t > 26) {
+    } else if (t > 78) {
       // sunhat brim
       for (let xx = -8; xx <= 8; xx++) D3.px(c, 20 + xx, 7);
       for (let yy = 0; yy < 3; yy++) for (let xx = -3; xx <= 3; xx++)
         D3.px(c, 20 + xx, 4 + yy);
     }
     // scarf for very cold
-    if (t < 0) for (let xx = -5; xx <= 5; xx++) D3.px(c, 20 + xx, 16, D3.getAccent());
+    if (t < 32) for (let xx = -5; xx <= 5; xx++) D3.px(c, 20 + xx, 16, D3.getAccent());
     // umbrella for rain
     if (wmo.icon === 'rain' || wmo.icon === 'storm') {
       for (let xx = -10; xx <= 10; xx++) D3.px(c, 30 + xx, 4);
@@ -322,7 +322,7 @@ function Wardrobe({ s }) {
     }
   }, [t, wmo.icon]);
   return (<Card fig="G" title="WARDROBE" sub="Dress for today"
-    foot={<><span style={{color:'var(--slate)'}}>FEELS</span><span style={{color:'var(--rust)'}}>{s.current.feelsLike}°</span></>}>
+    foot={<><span style={{color:'var(--slate)'}}>FEELS</span><span style={{color:'var(--rust)'}}>{window.formatT(s.current.feelsLike)}</span></>}>
     <div style={{ width:'100%', textAlign:'center' }}>
       <canvas ref={ref} style={{ imageRendering:'pixelated', width: 120, height: 180 }} />
       <div style={{ fontFamily:'"VT323",monospace', fontSize: 22, color:'var(--rust)', lineHeight: 1 }}>{out}</div>
@@ -336,12 +336,12 @@ function OnThisDay({ s }) {
   const date = new Date();
   const seed = date.getMonth() * 31 + date.getDate();
   const lore = [
-    { hi: 37, lo: 5,   year: 1936, q: 'A sky like beaten copper.' },
-    { hi: 31, lo: 0,   year: 1888, q: 'The streets full of paper kites.' },
-    { hi: 39, lo: 13,  year: 1952, q: 'Heat enough to bend a horseshoe.' },
-    { hi: 22, lo: -7,  year: 1903, q: 'Frost upon the hayricks at dawn.' },
-    { hi: 29, lo: 16,  year: 1971, q: 'The geese went south two weeks early.' },
-    { hi: 35, lo: 9,   year: 1924, q: 'A perfect harvest moon.' },
+    { hi: 99, lo: 41, year: 1936, q: 'A sky like beaten copper.' },
+    { hi: 88, lo: 32, year: 1888, q: 'The streets full of paper kites.' },
+    { hi: 102, lo: 55, year: 1952, q: 'Heat enough to bend a horseshoe.' },
+    { hi: 71, lo: 19, year: 1903, q: 'Frost upon the hayricks at dawn.' },
+    { hi: 84, lo: 60, year: 1971, q: 'The geese went south two weeks early.' },
+    { hi: 95, lo: 48, year: 1924, q: 'A perfect harvest moon.' },
   ][seed % 6];
   const ref = useDraw(40, 30, 3, (c, tick) => {
     // ledger book illustration
@@ -354,7 +354,7 @@ function OnThisDay({ s }) {
   }, []);
   const dateStr = date.toLocaleDateString('en-US',{month:'short',day:'numeric'});
   return (<Card fig="H" title="ON THIS DAY" sub={dateStr}
-    foot={<><span style={{color:'var(--slate)'}}>EXTREME</span><span style={{color:'var(--rust)'}}>{lore.hi}°/{lore.lo}°</span></>}>
+    foot={<><span style={{color:'var(--slate)'}}>EXTREME</span><span style={{color:'var(--rust)'}}>{window.formatT(lore.hi)}/{window.formatT(lore.lo)}</span></>}>
     <div style={{ width:'100%' }}>
       <div style={{ fontFamily:'"VT323",monospace', fontSize: 13, letterSpacing: 1, color: 'var(--slate)' }}>
         ANNO {lore.year}
@@ -364,8 +364,8 @@ function OnThisDay({ s }) {
       </div>
       <div style={{ marginTop: 6, paddingTop: 4, borderTop: '1px dotted var(--ink)',
         display:'flex', justifyContent:'space-between', fontFamily:'"VT323",monospace', fontSize: 14 }}>
-        <span>HI <span style={{color:'var(--rust)'}}>{lore.hi}°</span></span>
-        <span>LO <span style={{color:'var(--rust)'}}>{lore.lo}°</span></span>
+        <span>HI <span style={{color:'var(--rust)'}}>{window.formatT(lore.hi)}</span></span>
+        <span>LO <span style={{color:'var(--rust)'}}>{window.formatT(lore.lo)}</span></span>
       </div>
     </div>
   </Card>);
@@ -373,7 +373,7 @@ function OnThisDay({ s }) {
 
 function InstrumentsSection({ s, dark }) {
   return (
-    <section style={{ padding: '36px 28px 24px', background: 'var(--paper)' }}>
+    <section className="pad-section" style={{ padding: '36px 28px 24px', background: 'var(--paper)' }}>
       <div style={{ display:'flex', justifyContent:'space-between',
         fontFamily:'"VT323",monospace', fontSize: 14, letterSpacing: 2, color: 'var(--slate)' }}>
         <span>FIG. III · INSTRUMENTS OF THE OBSERVATORY</span>
@@ -386,14 +386,14 @@ function InstrumentsSection({ s, dark }) {
       <div style={{ textAlign: 'center', fontStyle: 'italic', fontSize: 18, marginTop: 4, marginBottom: 18 }}>
         Gauges, dials, and ledgers of the day
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
+      <div className="grid-instruments-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)',
         borderTop: '2px solid var(--ink)', borderBottom: '1px dashed var(--ink)' }}>
         <Barometer s={s} />
         <UVGauge s={s} />
         <SunClock s={s} />
         <WindRose s={s} last />
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1.3fr 1fr 1.2fr',
+      <div className="grid-instruments-2" style={{ display: 'grid', gridTemplateColumns: '1.1fr 1.3fr 1fr 1.2fr',
         borderBottom: '2px solid var(--ink)' }}>
         <Hygrometer s={s} />
         <Astronomy s={s} />

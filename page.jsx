@@ -17,9 +17,9 @@ function useTheme() {
     try { localStorage.setItem('almanac-theme', dark ? 'dark' : 'light'); } catch {}
     // Update Dither so canvas drawings flip.
     if (dark) {
-      D.setTheme({ ink: '#f3ecd9', paper: '#14110d', accent: '#e8754d', mode: 'dot' });
+      D.setTheme({ ink: '#f3ecd9', paper: '#14110d', accent: '#c45e6e', mode: 'dot' });
     } else {
-      D.setTheme({ ink: '#1a1612', paper: '#f3ecd9', accent: '#c25a3a', mode: 'dot' });
+      D.setTheme({ ink: '#1a1612', paper: '#f3ecd9', accent: '#7a2f3a', mode: 'dot' });
     }
   }, [dark]);
   return [dark, setDark];
@@ -35,6 +35,56 @@ function useTick(speed = 1) {
     return () => cancelAnimationFrame(raf);
   }, [speed]);
   return t;
+}
+
+// Live wall-clock — re-renders consumers every `intervalMs` (default 60s).
+// Use for "X min ago" labels and date displays that should flip at midnight.
+function useNow(intervalMs = 60000) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+function relativeTime(then, now) {
+  if (!then) return '—';
+  const ms = (now || new Date()).getTime() - then.getTime();
+  if (ms < 60_000) return 'just now';
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+// ── temperature unit (C/F) ───────────────────────────────────────
+window.__tempUnit = window.__tempUnit
+  || (() => { try { return localStorage.getItem('almanac-unit') || 'F'; } catch { return 'F'; } })();
+window.formatT = (f) => {
+  if (f == null || isNaN(f)) return '—°';
+  const u = window.__tempUnit;
+  return u === 'C' ? `${Math.round((f - 32) * 5/9)}°` : `${Math.round(f)}°`;
+};
+window.formatTNum = (f) => {
+  if (f == null || isNaN(f)) return 0;
+  const u = window.__tempUnit;
+  return u === 'C' ? Math.round((f - 32) * 5/9) : Math.round(f);
+};
+function useTempUnit() {
+  const [u, setU] = useState(() => window.__tempUnit);
+  useEffect(() => {
+    const handler = () => setU(window.__tempUnit);
+    window.addEventListener('tempunitchange', handler);
+    return () => window.removeEventListener('tempunitchange', handler);
+  }, []);
+  const set = (next) => {
+    window.__tempUnit = next;
+    try { localStorage.setItem('almanac-unit', next); } catch {}
+    window.dispatchEvent(new Event('tempunitchange'));
+  };
+  return [u, set];
 }
 
 function useWeather() {
@@ -170,6 +220,23 @@ function ThemeToggle({ dark, onToggle }) {
   );
 }
 
+// ── unit toggle ────────────────────────────────────────────────────
+function UnitToggle({ unit, onToggle }) {
+  return (
+    <button className="theme-toggle unit-toggle" onClick={onToggle}
+      aria-label="Toggle temperature unit">
+      <span style={{
+        fontFamily: '"VT323",monospace', fontSize: 16, letterSpacing: 1,
+        display: 'inline-flex', alignItems: 'center', gap: 4,
+      }}>
+        <span style={{ color: unit === 'F' ? 'var(--rust)' : 'inherit', fontWeight: unit === 'F' ? 700 : 400 }}>°F</span>
+        <span style={{ color: 'var(--slate)' }}>/</span>
+        <span style={{ color: unit === 'C' ? 'var(--rust)' : 'inherit', fontWeight: unit === 'C' ? 700 : 400 }}>°C</span>
+      </span>
+    </button>
+  );
+}
+
 // ── Loading ────────────────────────────────────────────────────────
 function Loading({ dark }) {
   const [d, setD] = useState(0);
@@ -184,33 +251,88 @@ function Loading({ dark }) {
   );
 }
 
-// ── Masthead / Header ──────────────────────────────────────────────
-function Masthead({ s }) {
-  const today = (s.daily && s.daily[0]) || {};
-  const date = today.date || new Date();
-  const dayName = date.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase();
-  const dateLine = date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
+// ── Error UI ───────────────────────────────────────────────────────
+// Inline banner shown above the page when we have stale data + a failed refresh.
+function ErrorBanner({ msg, onRetry }) {
   return (
-    <header style={{ padding: '24px 28px 12px', borderBottom: '4px double var(--ink)', position: 'relative' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: '"VT323", monospace',
-        fontSize: 14, letterSpacing: 2, marginBottom: 6, color: 'var(--slate)' }}>
-        <span>VOL. MMXXVI · NO. {String(date.getDate()).padStart(2,'0')}</span>
-        <span>EST. 1792</span>
-        <span>{(s.current.pressure / 33.8639).toFixed(2)} INHG</span>
+    <div role="alert" style={{
+      background: 'var(--rust)', color: 'var(--paper)',
+      padding: '8px 16px',
+      fontFamily: '"VT323", monospace', fontSize: 16, letterSpacing: 1,
+      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+      borderBottom: '2px solid var(--ink)',
+    }}>
+      <span style={{ flex: 1, minWidth: 0 }}>⚠ TRANSMISSION FAULT — {msg || 'WEATHER SERVICE UNAVAILABLE'}</span>
+      <button onClick={onRetry} style={{
+        background: 'var(--paper)', color: 'var(--ink)',
+        border: '2px solid var(--ink)', padding: '2px 10px',
+        fontFamily: '"VT323", monospace', fontSize: 14, letterSpacing: 1,
+        cursor: 'pointer',
+      }}>RETRY</button>
+    </div>
+  );
+}
+
+// Full-page error shown when we have NO data at all (cold load failed, no cache).
+function ErrorPage({ msg, onRetry, dark }) {
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center',
+      justifyContent: 'center', flexDirection: 'column', gap: 18, padding: 28 }}>
+      <HeroScene kind="storm" dark={dark} w={120} h={120} scale={6} />
+      <div style={{ fontFamily: '"VT323", monospace', fontSize: 24, letterSpacing: 1, color: 'var(--rust)' }}>
+        TRANSMISSION FAULT
       </div>
-      <div style={{ fontFamily: '"VT323", monospace', fontSize: 'clamp(48px, 8vw, 110px)',
-        color: 'var(--rust)', lineHeight: 0.92, textAlign: 'center', letterSpacing: 4, fontWeight: 400,
+      <div style={{ fontFamily: '"Crimson Pro", serif', fontStyle: 'italic', fontSize: 16,
+        textAlign: 'center', maxWidth: 380, color: 'var(--ink)' }}>
+        {msg || 'Unable to reach the weather service.'}
+      </div>
+      <button onClick={onRetry} style={{
+        background: 'var(--paper)', color: 'var(--ink)',
+        border: '2px solid var(--ink)', boxShadow: '3px 3px 0 var(--ink)',
+        padding: '6px 14px', fontFamily: '"VT323", monospace',
+        fontSize: 18, letterSpacing: 1, cursor: 'pointer',
+      }}>RETRY TRANSMISSION</button>
+    </div>
+  );
+}
+
+// ── Masthead / Header ──────────────────────────────────────────────
+function Masthead({ s, dark, onToggleDark, unit, onToggleUnit }) {
+  const now = useNow(60000);                // live clock — flips at midnight
+  const dayName = now.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase();
+  const dateLine = now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
+  const timeLine = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return (
+    <header style={{ padding: '14px 28px 12px', borderBottom: '4px double var(--ink)', position: 'relative' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
+        flexWrap: 'wrap', fontFamily: '"VT323", monospace',
+        fontSize: 14, letterSpacing: 2, marginBottom: 6, color: 'var(--slate)' }}>
+        <span>VOL. MMXXVI · NO. {String(now.getDate()).padStart(2,'0')}</span>
+        <span>EST. 1792 · {(s.current.pressure / 33.8639).toFixed(2)} INHG</span>
+        <div className="toggle-bar">
+          <UnitToggle unit={unit} onToggle={onToggleUnit} />
+          <ThemeToggle dark={dark} onToggle={onToggleDark} />
+        </div>
+      </div>
+      <h1 className="masthead-title" style={{ fontFamily: '"VT323", monospace', fontSize: 'clamp(48px, 8vw, 110px)',
+        color: 'var(--rust)', lineHeight: 0.92, textAlign: 'center', letterSpacing: 4, fontWeight: 400, margin: 0,
         animation: 'flicker 5s infinite', textShadow: '2px 2px 0 color-mix(in srgb, var(--ink) 14%, transparent)' }}>
         THE&nbsp;WEATHER&nbsp;ALMANAC
-      </div>
+      </h1>
       <div style={{ textAlign: 'center', fontStyle: 'italic', fontSize: 16, marginTop: 6 }}>
         A Daily Register of Atmospheric Phenomena, with Tables, Forecasts &amp; Celestial Notes
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10,
         borderTop: '1px solid var(--ink)', paddingTop: 6, fontFamily: '"VT323", monospace',
         fontSize: 16, letterSpacing: 1 }}>
-        <span>{dayName} · {dateLine}</span>
-        <span>{s.location?.name}</span>
+        <span>{dayName} · {dateLine} · {timeLine}</span>
+        <span>
+          {s.location?.name}
+          {s.refreshing && (
+            <span style={{ marginLeft: 8, color: 'var(--rust)',
+              animation: 'pulse 1.2s ease-in-out infinite' }}>· refreshing</span>
+          )}
+        </span>
       </div>
     </header>
   );
@@ -220,12 +342,12 @@ function Masthead({ s }) {
 function BroadsheetSection({ s, dark }) {
   const c = s.current, d = s.daily || [], h = s.hourly || [];
   const today = d[0] || {};
-  const tempRoll = useRoll(c.temp, 1400);
-  const feelsRoll = useRoll(c.feelsLike, 1500);
+  const tempRoll = useRoll(window.formatTNum(c.temp), 1400);
+  const feelsRoll = useRoll(window.formatTNum(c.feelsLike), 1500);
   return (
-    <section style={{ padding: '0 28px 22px', position: 'relative' }}>
+    <section className="pad-section" style={{ padding: '0 28px 22px', position: 'relative' }}>
       <div className="stipple-bg" />
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.5fr) minmax(0, 1fr)',
+      <div className="grid-broadsheet" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.5fr) minmax(0, 1fr)',
         gap: 24, position: 'relative', zIndex: 1 }}>
         {/* LEFT — hero */}
         <div className="reveal">
@@ -233,10 +355,10 @@ function BroadsheetSection({ s, dark }) {
             color: 'var(--slate)', borderBottom: '1px solid var(--ink)', paddingBottom: 4, marginTop: 18 }}>
             ☼ AT THIS MOMENT ☼
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 18, alignItems: 'center', marginTop: 10 }}>
+          <div className="grid-hero" style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 18, alignItems: 'center', marginTop: 10 }}>
             <HeroScene kind={c.wmo.icon} dark={dark} w={300} h={240} scale={6} />
             <div>
-              <div style={{ fontFamily: '"VT323",monospace', fontSize: 'clamp(120px, 16vw, 220px)',
+              <div className="hero-temp" style={{ fontFamily: '"VT323",monospace', fontSize: 'clamp(120px, 16vw, 220px)',
                 lineHeight: 0.82, fontWeight: 400, fontFeatureSettings: '"tnum"',
                 color: 'var(--ink)', textShadow: '4px 4px 0 color-mix(in srgb, var(--rust) 25%, transparent)' }}>
                 {tempRoll}°
@@ -255,7 +377,7 @@ function BroadsheetSection({ s, dark }) {
           </div>
 
           {/* Reading of the heavens — drop-cap narrative */}
-          <article style={{ marginTop: 18, fontSize: 17, lineHeight: 1.5, columnCount: 2,
+          <article className="col-2" style={{ marginTop: 18, fontSize: 17, lineHeight: 1.5, columnCount: 2,
             columnGap: 18, columnRule: '1px solid var(--ink)', textWrap: 'pretty' }}>
             <h3 style={{ fontFamily: '"VT323", monospace', fontSize: 14, letterSpacing: 2,
               color: 'var(--slate)', margin: '0 0 4px', columnSpan: 'all' }}>
@@ -294,8 +416,8 @@ function BroadsheetSection({ s, dark }) {
                     <td style={{ width: 56 }}>{day.date.toLocaleDateString('en-US',{weekday:'short'}).toUpperCase()}</td>
                     <td style={{ width: 36 }}><SmallIcon kind={day.wmo.icon} size={26} dark={dark} /></td>
                     <td>{day.wmo.label}</td>
-                    <td style={{ color: 'var(--rust)', textAlign: 'right' }}>{day.hi}°</td>
-                    <td style={{ color: 'var(--slate)', textAlign: 'right', width: 36 }}>{day.lo}°</td>
+                    <td style={{ color: 'var(--rust)', textAlign: 'right' }}>{window.formatT(day.hi)}</td>
+                    <td style={{ color: 'var(--slate)', textAlign: 'right', width: 36 }}>{window.formatT(day.lo)}</td>
                     <td style={{ textAlign: 'right', width: 56, fontSize: 14 }}>
                       {day.precipProb > 5 ? `${day.precipProb}%☂` : '·'}
                     </td>
@@ -310,7 +432,7 @@ function BroadsheetSection({ s, dark }) {
               color: 'var(--slate)', borderBottom: '1px solid var(--ink)', paddingBottom: 4 }}>
               ◆ OBSERVATIONS ◆
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 18 }}>
+            <div className="grid-observations" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 18 }}>
               {[
                 ['WIND', `${c.wind} ${c.windDir}`],
                 ['GUSTS', `${c.gusts} MPH`],
@@ -366,7 +488,7 @@ function HourlyTicker({ hours, dark }) {
                 {hr.time.getHours().toString().padStart(2,'0')}h
               </span>
               <SmallIcon kind={wmo.icon} size={22} dark={dark} />
-              <span style={{ color: 'var(--rust)' }}>{hr.temp}°</span>
+              <span style={{ color: 'var(--rust)' }}>{window.formatT(hr.temp)}</span>
               {hr.precipProb > 5 && <span style={{ fontSize: 14, color: 'var(--slate)' }}>☂{hr.precipProb}%</span>}
             </div>
           );
@@ -389,7 +511,7 @@ function CelestialSection({ s, dark }) {
   sunPos = Math.max(0, Math.min(1, sunPos));
 
   return (
-    <section style={{ padding: '36px 28px 64px', position: 'relative',
+    <section className="pad-section" style={{ padding: '36px 28px 64px', position: 'relative',
       background: 'var(--paper-2)', borderTop: '4px double var(--ink)', overflow: 'hidden' }}>
       <div className="stipple-bg" style={{ opacity: .12 }} />
 
@@ -423,7 +545,7 @@ function CelestialSection({ s, dark }) {
         <Horizon dark={dark} />
 
         {/* Two-column moon + 5 day */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.6fr', gap: 28, marginTop: 24 }}>
+        <div className="grid-celestial" style={{ display: 'grid', gridTemplateColumns: '1fr 1.6fr', gap: 28, marginTop: 24 }}>
           <div className="reveal" style={{ borderRight: '1px dashed var(--ink)', paddingRight: 24 }}>
             <div style={{ fontFamily: '"VT323",monospace', fontSize: 14, letterSpacing: 3,
               color: 'var(--slate)', marginBottom: 8 }}>☾ LUNAR ☾</div>
@@ -444,7 +566,7 @@ function CelestialSection({ s, dark }) {
           <div className="reveal" style={{ animationDelay: '.15s' }}>
             <div style={{ fontFamily: '"VT323",monospace', fontSize: 14, letterSpacing: 3,
               color: 'var(--slate)', marginBottom: 8 }}>★ FIVE DAYS HENCE ★</div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
+            <div className="grid-fivedays" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
               {d.slice(1, 6).map((day, i) => (
                 <div key={i} style={{ textAlign: 'center', fontFamily: '"VT323",monospace',
                   borderRight: i < 4 ? '1px dotted var(--ink)' : 'none', padding: '4px 6px' }}>
@@ -454,8 +576,8 @@ function CelestialSection({ s, dark }) {
                   <div style={{ display: 'flex', justifyContent: 'center', margin: '4px 0' }}>
                     <SmallIcon kind={day.wmo.icon} size={42} dark={dark} />
                   </div>
-                  <div style={{ fontSize: 22, color: 'var(--rust)', lineHeight: 1 }}>{day.hi}°</div>
-                  <div style={{ fontSize: 16, color: 'var(--slate)' }}>{day.lo}°</div>
+                  <div style={{ fontSize: 22, color: 'var(--rust)', lineHeight: 1 }}>{window.formatT(day.hi)}</div>
+                  <div style={{ fontSize: 16, color: 'var(--slate)' }}>{window.formatT(day.lo)}</div>
                   {day.precipProb > 5 && <div style={{ fontSize: 12, color: 'var(--slate)' }}>☂{day.precipProb}%</div>}
                 </div>
               ))}
@@ -572,12 +694,20 @@ function Horizon({ dark }) {
 
 // ── Footer ───────────────────────────────────────────────────────
 function Footer({ s }) {
+  const now = useNow(30000);                // 30s tick — fine for "X min ago"
+  const fresh = relativeTime(s.fetchedAt, now);
   return (
     <footer style={{ borderTop: '4px double var(--ink)', padding: '14px 28px 22px',
       fontFamily: '"VT323", monospace', fontSize: 16, color: 'var(--slate)',
       display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-      <span>DATA · OPEN-METEO · {s.fetchedAt?.toLocaleTimeString() || '—'}</span>
-      <span style={{ color: 'var(--rust)' }}>● TRANSMISSION COMPLETE</span>
+      <span>
+        DATA · OPEN-METEO · UPDATED <span style={{ color: 'var(--ink)' }}>{fresh}</span>
+        {s.refreshing && <span style={{ color: 'var(--rust)', marginLeft: 8,
+          animation: 'pulse 1.2s ease-in-out infinite' }}>· REFRESHING</span>}
+      </span>
+      <span style={{ color: 'var(--rust)' }}>
+        {s.error ? '● TRANSMISSION FAULT' : '● TRANSMISSION COMPLETE'}
+      </span>
       <span>{s.location?.lat?.toFixed(2)}°N {s.location?.lon?.toFixed(2)}°W</span>
     </footer>
   );
@@ -586,25 +716,48 @@ function Footer({ s }) {
 // ── Page ─────────────────────────────────────────────────────────
 function Page() {
   const [dark, setDark] = useTheme();
+  const [unit, setUnit] = useTempUnit();
   const s = useWeather();
 
-  const Diorama = window.WeatherDiorama;
+  const Diorama = window.DayInWeather || window.WeatherDiorama;
   const Instruments = window.InstrumentsSection;
+
+  // Three rendering states:
+  //   1. No data + still loading → Loading splash
+  //   2. No data + error         → full-page ErrorPage
+  //   3. Have data (fresh OR cached) → render page; show ErrorBanner if a refresh failed
+  const hasData = !!s.current;
+  const cold = !hasData && s.loading;
+  const fatal = !hasData && !!s.error;
+
+  const onToggleDark = () => setDark(d => !d);
+  const onToggleUnit = () => setUnit(unit === 'F' ? 'C' : 'F');
+
   return (
     <div style={{ minHeight: '100vh', background: 'var(--paper)', color: 'var(--ink)' }}>
-      <ThemeToggle dark={dark} onToggle={() => setDark(d => !d)} />
-      {s.loading || !s.current
-        ? <Loading dark={dark} />
-        : (
-          <>
-            <Masthead s={s} />
-            <BroadsheetSection s={s} dark={dark} />
-            {Instruments && <Instruments s={s} dark={dark} />}
-            {Diorama && <Diorama s={s} dark={dark} />}
-            <CelestialSection s={s} dark={dark} />
-            <Footer s={s} />
-          </>
-        )}
+      {/* Toggles float at top-right ONLY while loading/error (no masthead).
+          Once data arrives, the masthead renders them inline in its metadata row. */}
+      {!hasData && (
+        <div className="toggle-bar toggle-bar--floating">
+          <UnitToggle unit={unit} onToggle={onToggleUnit} />
+          <ThemeToggle dark={dark} onToggle={onToggleDark} />
+        </div>
+      )}
+      {cold && <Loading dark={dark} />}
+      {fatal && <ErrorPage msg={s.error} onRetry={() => W.reload()} dark={dark} />}
+      {hasData && (
+        <>
+          {s.error && <ErrorBanner msg={s.error} onRetry={() => W.reload()} />}
+          <Masthead s={s}
+            dark={dark} onToggleDark={onToggleDark}
+            unit={unit} onToggleUnit={onToggleUnit} />
+          <BroadsheetSection s={s} dark={dark} />
+          {Instruments && <Instruments s={s} dark={dark} />}
+          {Diorama && <Diorama s={s} dark={dark} />}
+          <CelestialSection s={s} dark={dark} />
+          <Footer s={s} />
+        </>
+      )}
     </div>
   );
 }

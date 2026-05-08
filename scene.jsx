@@ -963,7 +963,7 @@ function WeatherDiorama({ s, dark }) {
   const kind = cur._kind || codeToKind(cur.code);
 
   return (
-    <section style={{ padding: '36px 28px 24px', position: 'relative', overflow: 'hidden',
+    <section className="pad-section" style={{ padding: '36px 28px 24px', position: 'relative', overflow: 'hidden',
       background: 'var(--paper)' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         marginBottom: 6, fontFamily: '"VT323", monospace', fontSize: 14, letterSpacing: 2,
@@ -1023,7 +1023,7 @@ function WeatherDiorama({ s, dark }) {
         <span ref={labelRef} style={{ fontStyle: 'italic', color: 'var(--ink)', textAlign: 'center', flex: 1 }}>
           {KIND_LABEL[kind] || ''}
         </span>
-        <span style={{ color: 'var(--rust)' }}>{cur.temp}° · {cur.precipProb}%☂</span>
+        <span style={{ color: 'var(--rust)' }}>{window.formatT(cur.temp)} · {cur.precipProb}%☂</span>
       </div>
 
       {/* Bottom dotted ornament — matches celestial */}
@@ -1036,3 +1036,13 @@ function WeatherDiorama({ s, dark }) {
 }
 
 window.WeatherDiorama = WeatherDiorama;
+window.WeatherScene = {
+  renderScene, codeToKind, KIND_LABEL,
+  // primitives
+  blit, drawPerson, ground, distantTree, distantHouse, bigTree,
+  rainParticles, snowParticles, fogBands, lightning, rainbow,
+  birdsFlight, skyline, lamppost, picketFence, telephonePole,
+  wireBetween, mailbox, shrub, parkBench, sign, cat, dog, puddle,
+  street, starsField, snowdrift, backgroundFigure, drawWindowScene,
+  SPR, PROPS,
+};

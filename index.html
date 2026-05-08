@@ -12,14 +12,14 @@
       --paper: #f3ecd9;
       --paper-2: #e6dcc1;
       --ink: #1a1612;
-      --rust: #c25a3a;
+      --rust: #7a2f3a;
       --slate: #5a6b76;
     }
     [data-theme="dark"] {
       --paper: #14110d;
       --paper-2: #1d1915;
       --ink: #f3ecd9;
-      --rust: #e8754d;
+      --rust: #c45e6e;
       --slate: #8e9aa3;
     }
     html, body { margin: 0; padding: 0; background: var(--paper); color: var(--ink); font-family: "Crimson Pro", Georgia, serif; transition: background .4s, color .4s; }
@@ -35,18 +35,25 @@
 
     .reveal { animation: appear .6s ease-out both; }
 
-    /* Theme toggle */
+    /* Theme & unit toggles. Position is set by the parent (inline in masthead,
+       or floating top-right during loading/error states). */
     .theme-toggle {
-      position: fixed; top: 14px; right: 14px; z-index: 50;
       background: var(--paper); color: var(--ink); border: 2px solid var(--ink);
       box-shadow: 3px 3px 0 var(--ink);
-      padding: 6px 10px; font-family: "VT323", monospace; font-size: 16px;
+      padding: 4px 10px; font-family: "VT323", monospace; font-size: 14px;
       letter-spacing: 1px; cursor: pointer; user-select: none;
-      display: flex; align-items: center; gap: 8px;
+      display: inline-flex; align-items: center; gap: 6px;
       transition: transform .12s;
+      line-height: 1;
     }
     .theme-toggle:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 var(--ink); }
     .theme-toggle:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--ink); }
+    .toggle-bar {
+      display: flex; gap: 8px; align-items: center;
+    }
+    .toggle-bar--floating {
+      position: fixed; top: 14px; right: 14px; z-index: 50;
+    }
 
     /* Subtle stipple background, painted from CSS */
     .stipple-bg {
@@ -82,6 +89,43 @@
     /* Hover gloss for stat blocks */
     .stat-block { transition: transform .15s; }
     .stat-block:hover { transform: translate(-1px,-1px); }
+
+    /* ─── RESPONSIVE ─── */
+    @media (max-width: 900px) {
+      .dw-story-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
+      .grid-broadsheet { grid-template-columns: 1fr !important; gap: 18px !important; }
+      .grid-hero { grid-template-columns: 1fr !important; gap: 12px !important; text-align: center; }
+      .grid-hero > * { justify-self: center; }
+      .grid-celestial { grid-template-columns: 1fr !important; gap: 18px !important; }
+      .grid-celestial > div:first-child { border-right: none !important; border-bottom: 1px dashed var(--ink); padding-right: 0 !important; padding-bottom: 18px; }
+      .grid-instruments-1, .grid-instruments-2 { grid-template-columns: repeat(2, 1fr) !important; }
+      .grid-instruments-1 > div, .grid-instruments-2 > div {
+        border-right: none !important;
+        border-bottom: 1px dashed var(--ink);
+      }
+      .grid-instruments-1 > div:nth-child(2n), .grid-instruments-2 > div:nth-child(2n) { border-right: none !important; }
+      .grid-instruments-1 > div:nth-child(odd), .grid-instruments-2 > div:nth-child(odd) {
+        border-right: 1px dashed var(--ink) !important;
+      }
+      .col-2 { column-count: 1 !important; }
+      .grid-fivedays { grid-template-columns: repeat(3, 1fr) !important; row-gap: 12px; }
+      .almtable td { font-size: 16px !important; }
+      h1.masthead-title { font-size: clamp(40px, 12vw, 88px) !important; letter-spacing: 2px !important; }
+      h1.hero-temp { font-size: clamp(120px, 38vw, 220px) !important; }
+      .pad-section { padding-left: 14px !important; padding-right: 14px !important; }
+      .ticker { font-size: 14px !important; }
+      .theme-toggle { padding: 3px 8px !important; font-size: 13px !important; }
+      .toggle-bar--floating { top: 8px !important; right: 8px !important; }
+    }
+    @media (max-width: 560px) {
+      .grid-instruments-1, .grid-instruments-2 { grid-template-columns: 1fr !important; }
+      .grid-instruments-1 > div, .grid-instruments-2 > div {
+        border-right: none !important;
+        border-bottom: 1px dashed var(--ink) !important;
+      }
+      .grid-fivedays { grid-template-columns: repeat(2, 1fr) !important; }
+      .grid-observations { grid-template-columns: 1fr !important; }
+    }
   </style>
 
   <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
@@ -92,6 +136,7 @@
   <script src="dither.js"></script>
   <script type="text/babel" src="instruments.jsx"></script>
   <script type="text/babel" src="scene.jsx"></script>
+  <script type="text/babel" src="dayinweather.jsx"></script>
   <script type="text/babel" src="page.jsx"></script>
 </head>
 <body>
