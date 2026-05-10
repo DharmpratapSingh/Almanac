@@ -5,7 +5,7 @@
 
 const { useEffect, useState, useRef, useMemo, useCallback } = React;
 const D = window.Dither;
-const W = window.WeatherStore;
+const WS = window.WeatherStore;
 
 // ── theme hook ────────────────────────────────────────────────
 function useTheme() {
@@ -37,28 +37,6 @@ function useTick(speed = 1) {
   return t;
 }
 
-// Live wall-clock — re-renders consumers every `intervalMs` (default 60s).
-// Use for "X min ago" labels and date displays that should flip at midnight.
-function useNow(intervalMs = 60000) {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), intervalMs);
-    return () => clearInterval(id);
-  }, [intervalMs]);
-  return now;
-}
-
-function relativeTime(then, now) {
-  if (!then) return '—';
-  const ms = (now || new Date()).getTime() - then.getTime();
-  if (ms < 60_000) return 'just now';
-  const mins = Math.floor(ms / 60_000);
-  if (mins < 60) return `${mins} min ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
-
 // ── temperature unit (C/F) ───────────────────────────────────────
 window.__tempUnit = window.__tempUnit
   || (() => { try { return localStorage.getItem('almanac-unit') || 'F'; } catch { return 'F'; } })();
@@ -88,8 +66,8 @@ function useTempUnit() {
 }
 
 function useWeather() {
-  const [s, setS] = useState(() => ({ ...W.get() }));
-  useEffect(() => W.subscribe((next) => setS({ ...next })), []);
+  const [s, setS] = useState(() => ({ ...WS.get() }));
+  useEffect(() => WS.subscribe((next) => setS({ ...next })), []);
   return s;
 }
 
@@ -251,68 +229,19 @@ function Loading({ dark }) {
   );
 }
 
-// ── Error UI ───────────────────────────────────────────────────────
-// Inline banner shown above the page when we have stale data + a failed refresh.
-function ErrorBanner({ msg, onRetry }) {
-  return (
-    <div role="alert" style={{
-      background: 'var(--rust)', color: 'var(--paper)',
-      padding: '8px 16px',
-      fontFamily: '"VT323", monospace', fontSize: 16, letterSpacing: 1,
-      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
-      borderBottom: '2px solid var(--ink)',
-    }}>
-      <span style={{ flex: 1, minWidth: 0 }}>⚠ TRANSMISSION FAULT — {msg || 'WEATHER SERVICE UNAVAILABLE'}</span>
-      <button onClick={onRetry} style={{
-        background: 'var(--paper)', color: 'var(--ink)',
-        border: '2px solid var(--ink)', padding: '2px 10px',
-        fontFamily: '"VT323", monospace', fontSize: 14, letterSpacing: 1,
-        cursor: 'pointer',
-      }}>RETRY</button>
-    </div>
-  );
-}
-
-// Full-page error shown when we have NO data at all (cold load failed, no cache).
-function ErrorPage({ msg, onRetry, dark }) {
-  return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center',
-      justifyContent: 'center', flexDirection: 'column', gap: 18, padding: 28 }}>
-      <HeroScene kind="storm" dark={dark} w={120} h={120} scale={6} />
-      <div style={{ fontFamily: '"VT323", monospace', fontSize: 24, letterSpacing: 1, color: 'var(--rust)' }}>
-        TRANSMISSION FAULT
-      </div>
-      <div style={{ fontFamily: '"Crimson Pro", serif', fontStyle: 'italic', fontSize: 16,
-        textAlign: 'center', maxWidth: 380, color: 'var(--ink)' }}>
-        {msg || 'Unable to reach the weather service.'}
-      </div>
-      <button onClick={onRetry} style={{
-        background: 'var(--paper)', color: 'var(--ink)',
-        border: '2px solid var(--ink)', boxShadow: '3px 3px 0 var(--ink)',
-        padding: '6px 14px', fontFamily: '"VT323", monospace',
-        fontSize: 18, letterSpacing: 1, cursor: 'pointer',
-      }}>RETRY TRANSMISSION</button>
-    </div>
-  );
-}
-
 // ── Masthead / Header ──────────────────────────────────────────────
-function Masthead({ s, dark, onToggleDark, unit, onToggleUnit }) {
-  const now = useNow(60000);                // live clock — flips at midnight
-  const dayName = now.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase();
-  const dateLine = now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
-  const timeLine = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+function Masthead({ s }) {
+  const today = (s.daily && s.daily[0]) || {};
+  const date = today.date || new Date();
+  const dayName = date.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase();
+  const dateLine = date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
   return (
-    <header style={{ padding: '14px 28px 12px', borderBottom: '4px double var(--ink)', position: 'relative' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
-        flexWrap: 'wrap', fontFamily: '"VT323", monospace',
+    <header style={{ padding: '24px 28px 12px', borderBottom: '4px double var(--ink)', position: 'relative' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: '"VT323", monospace',
         fontSize: 14, letterSpacing: 2, marginBottom: 6, color: 'var(--slate)' }}>
-        <span>VOL. MMXXVI · NO. {String(now.getDate()).padStart(2,'0')}</span>
-        <span>EST. 1792 · {(s.current.pressure / 33.8639).toFixed(2)} INHG</span>
-        <div className="toggle-bar">
-          <UnitToggle unit={unit} onToggle={onToggleUnit} />
-          <ThemeToggle dark={dark} onToggle={onToggleDark} />
-        </div>
+        <span>VOL. MMXXVI · NO. {String(date.getDate()).padStart(2,'0')}</span>
+        <span>EST. 1792</span>
+        <span>{(s.current.pressure / 33.8639).toFixed(2)} INHG</span>
       </div>
       <h1 className="masthead-title" style={{ fontFamily: '"VT323", monospace', fontSize: 'clamp(48px, 8vw, 110px)',
         color: 'var(--rust)', lineHeight: 0.92, textAlign: 'center', letterSpacing: 4, fontWeight: 400, margin: 0,
@@ -325,14 +254,8 @@ function Masthead({ s, dark, onToggleDark, unit, onToggleUnit }) {
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10,
         borderTop: '1px solid var(--ink)', paddingTop: 6, fontFamily: '"VT323", monospace',
         fontSize: 16, letterSpacing: 1 }}>
-        <span>{dayName} · {dateLine} · {timeLine}</span>
-        <span>
-          {s.location?.name}
-          {s.refreshing && (
-            <span style={{ marginLeft: 8, color: 'var(--rust)',
-              animation: 'pulse 1.2s ease-in-out infinite' }}>· refreshing</span>
-          )}
-        </span>
+        <span>{dayName} · {dateLine}</span>
+        <span>{s.location?.name}</span>
       </div>
     </header>
   );
@@ -480,7 +403,7 @@ function HourlyTicker({ hours, dark }) {
         color: 'var(--slate)', marginBottom: 4 }}>HOURLY · NEXT 24 HOURS</div>
       <div className="ticker">
         {[...hours, ...hours].map((hr, i) => {
-          const wmo = (W.WMO && W.WMO[hr.code]) || { icon: 'cloud' };
+          const wmo = (WS.WMO && WS.WMO[hr.code]) || { icon: 'cloud' };
           return (
             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8,
               fontFamily: '"VT323", monospace', fontSize: 18, minWidth: 110, color: 'var(--ink)' }}>
@@ -694,20 +617,12 @@ function Horizon({ dark }) {
 
 // ── Footer ───────────────────────────────────────────────────────
 function Footer({ s }) {
-  const now = useNow(30000);                // 30s tick — fine for "X min ago"
-  const fresh = relativeTime(s.fetchedAt, now);
   return (
     <footer style={{ borderTop: '4px double var(--ink)', padding: '14px 28px 22px',
       fontFamily: '"VT323", monospace', fontSize: 16, color: 'var(--slate)',
       display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-      <span>
-        DATA · OPEN-METEO · UPDATED <span style={{ color: 'var(--ink)' }}>{fresh}</span>
-        {s.refreshing && <span style={{ color: 'var(--rust)', marginLeft: 8,
-          animation: 'pulse 1.2s ease-in-out infinite' }}>· REFRESHING</span>}
-      </span>
-      <span style={{ color: 'var(--rust)' }}>
-        {s.error ? '● TRANSMISSION FAULT' : '● TRANSMISSION COMPLETE'}
-      </span>
+      <span>DATA · OPEN-METEO · {s.fetchedAt?.toLocaleTimeString() || '—'}</span>
+      <span style={{ color: 'var(--rust)' }}>● TRANSMISSION COMPLETE</span>
       <span>{s.location?.lat?.toFixed(2)}°N {s.location?.lon?.toFixed(2)}°W</span>
     </footer>
   );
@@ -721,43 +636,22 @@ function Page() {
 
   const Diorama = window.DayInWeather || window.WeatherDiorama;
   const Instruments = window.InstrumentsSection;
-
-  // Three rendering states:
-  //   1. No data + still loading → Loading splash
-  //   2. No data + error         → full-page ErrorPage
-  //   3. Have data (fresh OR cached) → render page; show ErrorBanner if a refresh failed
-  const hasData = !!s.current;
-  const cold = !hasData && s.loading;
-  const fatal = !hasData && !!s.error;
-
-  const onToggleDark = () => setDark(d => !d);
-  const onToggleUnit = () => setUnit(unit === 'F' ? 'C' : 'F');
-
   return (
     <div style={{ minHeight: '100vh', background: 'var(--paper)', color: 'var(--ink)' }}>
-      {/* Toggles float at top-right ONLY while loading/error (no masthead).
-          Once data arrives, the masthead renders them inline in its metadata row. */}
-      {!hasData && (
-        <div className="toggle-bar toggle-bar--floating">
-          <UnitToggle unit={unit} onToggle={onToggleUnit} />
-          <ThemeToggle dark={dark} onToggle={onToggleDark} />
-        </div>
-      )}
-      {cold && <Loading dark={dark} />}
-      {fatal && <ErrorPage msg={s.error} onRetry={() => W.reload()} dark={dark} />}
-      {hasData && (
-        <>
-          {s.error && <ErrorBanner msg={s.error} onRetry={() => W.reload()} />}
-          <Masthead s={s}
-            dark={dark} onToggleDark={onToggleDark}
-            unit={unit} onToggleUnit={onToggleUnit} />
-          <BroadsheetSection s={s} dark={dark} />
-          {Instruments && <Instruments s={s} dark={dark} />}
-          {Diorama && <Diorama s={s} dark={dark} />}
-          <CelestialSection s={s} dark={dark} />
-          <Footer s={s} />
-        </>
-      )}
+      <ThemeToggle dark={dark} onToggle={() => setDark(d => !d)} />
+      <UnitToggle unit={unit} onToggle={() => setUnit(unit === 'F' ? 'C' : 'F')} />
+      {s.loading || !s.current
+        ? <Loading dark={dark} />
+        : (
+          <>
+            <Masthead s={s} />
+            <BroadsheetSection s={s} dark={dark} />
+            {Instruments && <Instruments s={s} dark={dark} />}
+            {Diorama && <Diorama s={s} dark={dark} />}
+            <CelestialSection s={s} dark={dark} />
+            <Footer s={s} />
+          </>
+        )}
     </div>
   );
 }

@@ -1,1510 +1,1015 @@
-// dayinweather.jsx — five different "A Day in the Weather" treatments with a switcher.
-// Each mode draws on the same hourly forecast but presents an entirely different visual
-// vocabulary. Toggle between them with the strip of buttons at the top.
+// dayinweather.jsx — single cinematic diorama.
+//
+// One world: a small wooden cabin on a coastal cliff at the edge of a pine
+// forest, view facing the sea. A wooden footpath leads down to a dock; one
+// bench sits halfway along it. A solitary figure in a heavy coat and scarf
+// is the only inhabitant. A distant lighthouse blinks on the headland.
+//
+// Time of day, weather, and camera shot all evolve continuously over a
+// 90-second loop. Every visual layer reads from the lighting model
+// (lighting.js) and the camera model (cinematography.js).
 
-const { useEffect, useRef, useState, useMemo } = React;
-const Dw = window.Dither;
-const WS = window.WeatherScene;
-const Wstore3 = window.WeatherStore;
+const { useEffect, useRef, useState, useMemo, useCallback } = React;
+const L = window.Lighting;
+const Cinema = window.Cinema;
+const PAL = L.PAL;
+const W = 320, H = 180;
+const HORIZON_Y = 96;          // sea/sky meet here in scene coords
+const CLIFF_Y   = 130;         // cabin sits on this elevation
+const PATH_TOP  = 132;
+const DOCK_Y    = 162;         // dock sits at sea level
 
-// ── shared timeline builder ───────────────────────────────────
-function useTimeline(s, dayIdx) {
-  return useMemo(() => {
-    const hourly = s.hourly || [];
-    const daily = s.daily || [];
-    let timeline = [];
-    if (dayIdx <= 1 && hourly.length) {
-      const start = dayIdx === 0 ? 0 : 12;
-      const slice = hourly.slice(start, start + 24);
-      // 8 evenly-sampled scenes
-      const step = Math.max(1, Math.floor(slice.length / 8));
-      timeline = slice.filter((_, i) => i % step === 0).slice(0, 8).map((h, i) => ({
-        label: i === 0 && dayIdx === 0 ? 'NOW'
-          : h.time.toLocaleTimeString('en-US', { hour: 'numeric' }).toUpperCase(),
-        hour: h.time.getHours(),
-        time: h.time,
-        code: h.code, temp: h.temp, precipProb: h.precipProb,
-      }));
-    } else if (daily[dayIdx]) {
-      const d = daily[dayIdx];
-      const labels = ['DAWN','MORN','LATE MORN','NOON','AFT.','LATE AFT.','EVE','NIGHT'];
-      const hours = [6, 9, 11, 12, 14, 16, 19, 22];
-      timeline = labels.map((label, i) => ({
-        label, hour: hours[i], time: new Date(d.date.getTime() + hours[i]*3600*1000),
-        code: d.code, temp: d.hi, precipProb: d.precipProb,
-      }));
-    }
-    return timeline;
-  }, [s, dayIdx]);
+const DAY_SECONDS = 90;        // one full 24h cycle in this many seconds
+
+// ── color helpers (re-using lighting.js's mixer) ────────────────
+const mix = L.mixHex;
+const desat = L.desat;
+const darken = L.darken;
+function withAlpha(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
 }
 
-function useTickRaf(active = true) {
-  const [t, setT] = useState(0);
+// ── deterministic noise for particle drift / scatter ────────────
+function vnoise(x, y, seed = 0) {
+  const v = Math.sin(x * 12.9898 + y * 78.233 + seed * 0.137) * 43758.5453;
+  return v - Math.floor(v);
+}
+// 1-D "perlin-ish" — sum of two sines with different periods, smooth in x.
+function pnoise1(x) {
+  return Math.sin(x * 0.7) * 0.6 + Math.sin(x * 1.9 + 1.3) * 0.4;
+}
+
+// ── shared draw primitives (operate on logical 320×180 canvas) ──
+function fr(ctx, x, y, w, h, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x|0, y|0, w|0, h|0);
+}
+function px(ctx, x, y, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x|0, y|0, 1, 1);
+}
+function discPix(ctx, cx, cy, r, color) {
+  ctx.fillStyle = color;
+  const r2 = r*r;
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    if (dx*dx + dy*dy <= r2) ctx.fillRect((cx+dx)|0, (cy+dy)|0, 1, 1);
+  }
+}
+function ringPix(ctx, cx, cy, r, color) {
+  ctx.fillStyle = color;
+  for (let a = 0; a < Math.PI * 2; a += 0.18) {
+    ctx.fillRect((cx + Math.cos(a)*r)|0, (cy + Math.sin(a)*r)|0, 1, 1);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 1 — SKY (deepest, parallax depth 0.0)
+//   • 4-stop vertical gradient interpolated per-row
+//   • stars at night with twinkle
+//   • sun and moon
+//   • drifting clouds (distant)
+// ════════════════════════════════════════════════════════════════
+function drawSky(ctx, light, t) {
+  // Vertical gradient — 4 stops over y=[0..HORIZON_Y].
+  // Stop positions: 0, 0.45, 0.78, 1.0
+  const top = light.sky.top, upper = light.sky.upper;
+  const lower = light.sky.lower, hor = light.sky.horizon;
+  for (let y = 0; y < HORIZON_Y; y++) {
+    const v = y / HORIZON_Y;
+    let c;
+    if (v < 0.45)      c = mix(top,   upper, v / 0.45);
+    else if (v < 0.78) c = mix(upper, lower, (v - 0.45) / 0.33);
+    else               c = mix(lower, hor,   (v - 0.78) / 0.22);
+    fr(ctx, 0, y, W, 1, c);
+  }
+
+  // Stars — only when starDensity > 0. Deterministic positions, gentle twinkle.
+  if (light.starDensity > 0.04) {
+    for (let i = 0; i < 90; i++) {
+      const sx = (i * 47 + 13) % W;
+      const sy = ((i * 31 + 7) % 70) + 4;
+      const tw = 0.5 + 0.5 * Math.sin(t * 0.0009 + i * 1.7);
+      const a = light.starDensity * tw;
+      if (a > 0.15) px(ctx, sx, sy, withAlpha(PAL.starWhite, a));
+    }
+    // Milky-way band on clear nights
+    if (light.starDensity > 0.7 && light.cloudy < 0.3) {
+      for (let i = 0; i < 60; i++) {
+        const sx = (i * 23 + t * 0.05) % W;
+        const sy = 30 + Math.sin(sx * 0.05) * 6 + (i % 3);
+        if (vnoise(sx, sy, 5) > 0.6)
+          px(ctx, sx, sy, withAlpha(PAL.starWhite, 0.35 * light.starDensity));
+      }
+    }
+  }
+
+  // Sun — soft warm halo + bright disc.
+  if (light.cel.sunVisible) {
+    const { sunX, sunY } = light.cel;
+    // Halo (3 dithered rings, larger when low/horizon)
+    const lowness = Math.max(0, 1 - sunY / 90);
+    const haloR = 8 + lowness * 6;
+    discPix(ctx, sunX, sunY, haloR + 2, withAlpha(PAL.dawnSoft, 0.10));
+    discPix(ctx, sunX, sunY, haloR,     withAlpha(PAL.dawnPeach, 0.18));
+    discPix(ctx, sunX, sunY, 5,         PAL.dawnSoft);
+    discPix(ctx, sunX, sunY, 3,         '#fff7e0');
+    // Lens-flare streak when low and clear
+    if (lowness > 0.4 && light.cloudy < 0.4) {
+      for (let dx = -16; dx <= 16; dx++) {
+        const a = (1 - Math.abs(dx)/16) * 0.4;
+        if (a > 0.1) px(ctx, sunX + dx, sunY, withAlpha(PAL.dawnSoft, a));
+      }
+    }
+  }
+
+  // Moon — at night/dusk.
+  if (light.cel.moonVisible && light.starDensity > 0.2) {
+    const { moonX, moonY } = light.cel;
+    discPix(ctx, moonX, moonY, 6, withAlpha(PAL.moonGlow, 0.18));
+    discPix(ctx, moonX, moonY, 3, PAL.moonGlow);
+    // crescent shadow (subtle)
+    if (light.starDensity > 0.6) px(ctx, moonX + 2, moonY - 1, darken(PAL.moonGlow, 0.5));
+  }
+
+  // Clouds — drift slowly. Density driven by light.cloudy.
+  if (light.cloudy > 0.05) {
+    const drift = (t * 4) | 0;          // px/s of wind
+    const count = Math.round(2 + light.cloudy * 8);
+    for (let i = 0; i < count; i++) {
+      const seed = i * 71 + 3;
+      const yPos = 12 + (seed % 50) * 0.7;
+      const xRaw = (seed * 17 - drift * (0.4 + (i%3)*0.3));
+      const cx = ((xRaw % (W + 80)) + (W + 80)) % (W + 80) - 40;
+      const cw = 22 + (seed % 18);
+      const ch = Math.max(4, cw * 0.32);
+      drawCloud(ctx, cx, yPos, cw, ch, light);
+    }
+  }
+}
+
+function drawCloud(ctx, cx, cy, w, h, light) {
+  // Painterly cloud — main body in cloudBright, soft underside in cloudShadow.
+  const top = light.cloudy > 0.7 ? PAL.cloudBright : mix(PAL.cloudBright, PAL.dawnSoft, light.cel.rim * 0.4);
+  const bot = light.cloudy > 0.7 ? PAL.cloudShadow : mix(PAL.cloudShadow, PAL.dayBlue, 0.3);
+  // 4 lumps
+  const lumps = [
+    [-w*0.4, 0,      h*0.55],
+    [-w*0.1, -h*0.35,h*0.7],
+    [ w*0.2, -h*0.2, h*0.65],
+    [ w*0.45,h*0.05, h*0.5],
+  ];
+  for (const [dx, dy, r] of lumps) {
+    discPix(ctx, cx + dx, cy + dy + 1, r, bot);
+  }
+  for (const [dx, dy, r] of lumps) {
+    discPix(ctx, cx + dx, cy + dy, r * 0.92, top);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 2 — SEA + LIGHTHOUSE (depth 0.15)
+// ════════════════════════════════════════════════════════════════
+function drawSea(ctx, light, t, paraDx) {
+  // Sea fills below horizon to cliff. We darken with depth (closer = lighter).
+  const SEA_TOP = HORIZON_Y;
+  const SEA_BOT = CLIFF_Y;
+  // Sea base
+  for (let y = SEA_TOP; y < SEA_BOT; y++) {
+    const v = (y - SEA_TOP) / (SEA_BOT - SEA_TOP);
+    let c = mix(PAL.seaMid, PAL.seaDeep, v);
+    // Weather: overcast leadens the sea
+    if (light.cloudy > 0.6) c = darken(c, 0.18);
+    if (light.cel.sunVisible && light.cel.sunY > 70) {
+      // golden hour glint near horizon
+      c = mix(c, PAL.dawnPeach, (1 - v) * light.cel.rim * 0.35);
+    }
+    fr(ctx, 0, y, W, 1, c);
+  }
+
+  // Wave crests — thin horizontal dashes that drift
+  const drift2 = t * 2;
+  const crestColor = mix(PAL.seaLight, PAL.seaFoam, 0.5);
+  for (let y = SEA_TOP + 2; y < SEA_BOT - 2; y += 2) {
+    const v = (y - SEA_TOP) / (SEA_BOT - SEA_TOP);
+    const segLen = 1 + (1 - v) * 4;
+    const speed = 0.4 + v * 1.6;
+    const wob = Math.sin(y * 0.21 + t * 0.002) * 6;
+    for (let x = -((drift2 * speed + y*7) % 14)|0; x < W; x += 14) {
+      if ((vnoise(x, y, 3) * 7 | 0) % 3 === 0) {
+        fr(ctx, x + wob, y, segLen, 1, withAlpha(crestColor, 0.55 - v*0.3));
+      }
+    }
+  }
+
+  // Distant sails on clear weather
+  if (light.cloudy < 0.5 && light.fog < 0.3 && light.rain < 0.1) {
+    const sailDrift = ((t * 0.1) % 80) | 0;
+    for (let i = 0; i < 2; i++) {
+      const sx = ((i * 90 - sailDrift + 120) % (W + 60)) - 30 + paraDx * 0.3;
+      const sy = SEA_TOP + 4 + i * 3;
+      // tiny triangular sail
+      px(ctx, sx,     sy,     PAL.cloudBright);
+      px(ctx, sx,     sy + 1, PAL.cloudBright);
+      px(ctx, sx + 1, sy + 1, PAL.cloudBright);
+      px(ctx, sx,     sy + 2, PAL.cloudBright);
+      px(ctx, sx - 1, sy + 2, mix(PAL.cloudShadow, PAL.seaDeep, 0.3));
+      px(ctx, sx + 1, sy + 2, mix(PAL.cloudShadow, PAL.seaDeep, 0.3));
+    }
+  }
+
+  // Lighthouse on far headland (right side, beyond cliff).
+  const lhX = 268 + paraDx * 0.2, lhBaseY = HORIZON_Y - 2;
+  // headland silhouette
+  for (let dx = -22; dx <= 22; dx++) {
+    const dh = Math.max(0, 6 - Math.abs(dx) * 0.3);
+    fr(ctx, lhX + dx, HORIZON_Y - dh, 1, dh + 4, darken(PAL.pineMid, 0.2));
+  }
+  // tower
+  fr(ctx, lhX - 1, lhBaseY - 14, 3, 12, PAL.cloudBright);
+  fr(ctx, lhX,     lhBaseY - 16, 1, 2,  PAL.cloudBright);
+  fr(ctx, lhX - 1, lhBaseY - 7,  3, 1,  PAL.scarfRed);  // red band
+  // lamp
+  if (light.lighthouseOn) {
+    // Lamp cube
+    fr(ctx, lhX - 1, lhBaseY - 17, 3, 2, PAL.windowGlow);
+    // Beam (slow rotating)
+    const beamAng = t * 0.8 + 0.4;
+    const beamLen = 70 + light.fog * 40;
+    for (let r = 1; r < beamLen; r += 1) {
+      const bx = lhX + Math.cos(beamAng) * r;
+      const by = (lhBaseY - 16) + Math.sin(beamAng) * r * 0.4;
+      const beamA = (1 - r / beamLen) * light.lighthouseBeam * 0.6;
+      if (beamA > 0.05 && bx > 0 && bx < W && by > 0 && by < HORIZON_Y) {
+        // beam thickness widens with distance
+        const wid = 0.5 + r * 0.06;
+        for (let dy = -wid; dy <= wid; dy++) {
+          const a = beamA * (1 - Math.abs(dy)/wid * 0.5);
+          if (a > 0.03) px(ctx, bx, by + dy, withAlpha(PAL.windowGlow, a));
+        }
+      }
+    }
+    // pulsing lamp halo
+    discPix(ctx, lhX, lhBaseY - 16, 2, withAlpha(PAL.windowGlow, 0.7));
+  }
+
+  // Distant rainbow over sea — only at golden hour with parted clouds.
+  // Treated as a rare moment, not a default decoration.
+  if (light.rain < 0.05 && light.cel.sunVisible && light.cel.rim > 0.35
+      && light.cloudy > 0.3 && light.cloudy < 0.7) {
+    const rbCx = 60, rbCy = 130, rbR = 70;
+    const bands = [
+      ['#9b59c5', 0.15], ['#5a87c8', 0.18], ['#5fa86a', 0.20],
+      ['#dfca52', 0.20], ['#d97a3a', 0.18], ['#b03a3a', 0.15],
+    ];
+    bands.forEach(([col, a], i) => {
+      for (let dx = -rbR; dx <= rbR; dx++) {
+        const dy = -Math.sqrt(Math.max(0, (rbR - i)*(rbR - i) - dx*dx));
+        if (dy < -10 && rbCy + dy > HORIZON_Y - 20)
+          px(ctx, rbCx + dx, rbCy + dy, withAlpha(col, a));
+      }
+    });
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 3 — FAR PINES SILHOUETTE (depth 0.35)
+// ════════════════════════════════════════════════════════════════
+function drawPines(ctx, light, t, paraDx, paraDy) {
+  // Pines fade in fog. Use ambient-tinted dark green silhouette.
+  const baseColor = light.fog > 0.4
+    ? mix(PAL.pineDark, PAL.fogBody, Math.min(0.6, light.fog * 0.7))
+    : mix(PAL.pineDark, light.ambient, 0.15);
+
+  // Rolling ridge on the LEFT side (cabin sits between pines and sea-cliff)
+  for (let i = 0; i < 14; i++) {
+    const baseX = -8 + i * 9 + paraDx * 0.5;
+    const seed = i * 31 + 7;
+    const treeH = 14 + (seed % 10);
+    const top = CLIFF_Y - treeH - (seed % 4);
+    drawPineTree(ctx, baseX, CLIFF_Y - 6, treeH, baseColor);
+  }
+  // A few mid-distance pines on right behind cabin
+  for (let i = 0; i < 4; i++) {
+    const x = 220 + i * 18 + paraDx * 0.4;
+    drawPineTree(ctx, x, CLIFF_Y - 4, 18 + (i*7 % 8), baseColor);
+  }
+  // Bend pines in wind (storm/heavy rain)
+  if (light.wind > 1.8) {
+    const bend = Math.sin(t * 0.0035) * Math.min(3, (light.wind - 1.8) * 1.5);
+    // already baked into trunk drift via vnoise — skip per-frame redraw
+    // (cheap "bend" hint: extra wind streaks)
+    for (let i = 0; i < 8; i++) {
+      const x = ((t * 6 + i * 47) % W) | 0;
+      const y = 80 + (i * 17) % 40;
+      px(ctx, x + bend*2, y, withAlpha(PAL.cloudShadow, 0.3));
+    }
+  }
+}
+
+function drawPineTree(ctx, x, baseY, h, color) {
+  // Triangular pine — multiple "tiers" stacking up.
+  const trunkH = 3;
+  fr(ctx, x, baseY - trunkH + 1, 1, trunkH, darken(color, 0.4));
+  // foliage tiers from bottom (wide) to top (narrow)
+  const tiers = Math.max(2, Math.floor(h / 4));
+  for (let ti = 0; ti < tiers; ti++) {
+    const tw = (tiers - ti) + 1;
+    const ty = baseY - trunkH - ti * 3;
+    for (let dx = -tw; dx <= tw; dx++) {
+      const dh = tw - Math.abs(dx);
+      for (let dy = 0; dy < dh; dy++) {
+        px(ctx, x + dx, ty - dy, color);
+      }
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 4 — CABIN, PATH, BENCH, DOCK (depth 0.7)
+// ════════════════════════════════════════════════════════════════
+function drawMidground(ctx, light, t, paraDx, paraDy) {
+  // Cliff — flat horizontal bands first (cheap), then per-x edge wobble.
+  // This is the largest area on screen so we paint it as full-width rows.
+  const grassEdge = mix(PAL.grassLight, light.ambient, 0.2);
+  for (let y = CLIFF_Y; y < HORIZON_Y + 80; y++) {
+    const depth = (y - CLIFF_Y) / 30;
+    let c;
+    if (depth < 0.08)      c = grassEdge;
+    else if (depth < 0.2)  c = PAL.grassDeep;
+    else if (depth < 0.6)  c = mix(PAL.grassDeep, PAL.pathDirt, depth * 1.2);
+    else                   c = darken(PAL.pathDirt, 0.2);
+    if (light.snow > 0.4 && depth < 0.18) c = mix(c, '#e6e9ef', Math.min(0.85, light.snow));
+    if (light.rain > 0.4 && depth < 0.3)  c = mix(c, light.sky.lower, 0.18);
+    fr(ctx, 0, y, W, 1, c);
+  }
+  // Edge wobble — uneven grass top against sky
+  for (let x = 0; x < W; x++) {
+    const wob = Math.sin(x * 0.15 + paraDx * 0.05) * 0.9 | 0;
+    if (wob > 0) px(ctx, x, CLIFF_Y - 1, grassEdge);
+    if (wob < 0) px(ctx, x, CLIFF_Y, light.sky.horizon);
+  }
+
+  // Cabin location — left-center on the cliff
+  const cbX = 92 + paraDx * 0.7;
+  const cbY = CLIFF_Y - 22;
+  drawCabin(ctx, cbX, cbY, light, t);
+
+  // Footpath from cabin curving down-right to dock
+  drawPath(ctx, cbX + 14, CLIFF_Y - 4, 230, DOCK_Y - 4, light, paraDx);
+
+  // Bench halfway down the path
+  const benchX = 162 + paraDx * 0.8;
+  const benchY = CLIFF_Y + 10;
+  drawBench(ctx, benchX, benchY, light);
+
+  // Dock at the end (right-bottom)
+  drawDock(ctx, 220 + paraDx, DOCK_Y, light, t);
+
+  // Foreground tall grass tufts on the cliff edge
+  drawGrassTufts(ctx, paraDx, light, t);
+}
+
+function drawCabin(ctx, x, y, light, t) {
+  // Wood walls
+  const wallLight = mix(PAL.woodLight, light.ambient, 0.15);
+  const wallDark  = darken(wallLight, 0.35);
+  // Snow cap on roof
+  const snowCap = light.snow > 0.4;
+  fr(ctx, x, y, 24, 16, wallLight);
+  // wall planks (vertical lines)
+  for (let dx = 0; dx < 24; dx += 3) px(ctx, x + dx, y + 8, wallDark);
+  for (let dx = 0; dx < 24; dx += 4) {
+    for (let dy = 1; dy < 16; dy++) px(ctx, x + dx, y + dy, darken(wallLight, 0.25));
+  }
+  // Roof — triangular slope
+  for (let dy = 0; dy < 8; dy++) {
+    const w = 30 - dy * 2;
+    const startX = x - 3 + dy;
+    fr(ctx, startX, y - 8 + dy, w, 1, dy === 0 ? PAL.cloudShadow : darken(PAL.woodDark, dy*0.05));
+  }
+  // Snow on roof
+  if (snowCap) {
+    for (let dy = 0; dy < 4; dy++) {
+      const w = 26 - dy * 2;
+      const startX = x - 1 + dy;
+      fr(ctx, startX, y - 7 + dy, w, 1, mix('#e9eef2', PAL.cloudBright, dy*0.2));
+    }
+  }
+  // Chimney with smoke
+  fr(ctx, x + 16, y - 12, 2, 6, PAL.cloudShadow);
+  fr(ctx, x + 15, y - 12, 4, 1, darken(PAL.cloudShadow, 0.3));
+  if (light.windowGlow > 0.3) {
+    // smoke puffs
+    const smokeT = t * 0.5;
+    for (let i = 0; i < 4; i++) {
+      const sx = x + 17 + Math.sin(smokeT * 0.04 + i) * (i + 1);
+      const sy = y - 14 - i * 3 - (smokeT * 2 % 8);
+      const a = 0.6 - i * 0.12;
+      if (a > 0.05) discPix(ctx, sx, sy, 1 + (i%2), withAlpha(PAL.cloudShadow, a));
+    }
+  }
+  // Window — warm glow
+  const winY = y + 4, winX = x + 3;
+  if (light.windowGlow > 0.05) {
+    // halo around window
+    discPix(ctx, winX + 2, winY + 1, 5, withAlpha(PAL.windowHalo, 0.10 * light.windowGlow));
+    discPix(ctx, winX + 2, winY + 1, 3, withAlpha(PAL.windowGlow, 0.30 * light.windowGlow));
+  }
+  fr(ctx, winX, winY, 5, 4, light.windowGlow > 0.1
+    ? mix(PAL.windowGlow, '#ffe9a8', light.windowGlow)
+    : darken(wallLight, 0.5));
+  // mullion cross
+  fr(ctx, winX, winY + 1, 5, 1, PAL.woodDark);
+  fr(ctx, winX + 2, winY, 1, 4, PAL.woodDark);
+  // Door
+  fr(ctx, x + 18, y + 6, 4, 10, PAL.woodDark);
+  px(ctx, x + 21, y + 11, PAL.windowGlow);  // doorknob
+}
+
+function drawPath(ctx, x0, y0, x1, y1, light, paraDx) {
+  // Bezier-ish dirt path with wooden planks
+  const steps = 60;
+  let prevX = x0, prevY = y0;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const e = t * t * (3 - 2 * t);
+    const cx = x0 + (x1 - x0) * t + Math.sin(t * Math.PI * 1.5) * 8;
+    const cy = y0 + (y1 - y0) * e;
+    // Width tapers (more dramatic perspective)
+    const w = 5 - t * 2;
+    for (let dx = -w; dx <= w; dx++) {
+      let c = mix(PAL.pathDirt, light.ambient, 0.1);
+      if (Math.abs(dx) >= w - 0.5) c = darken(c, 0.4);
+      if (light.snow > 0.4) c = mix(c, '#e6eaf0', Math.min(0.7, light.snow));
+      if (light.rain > 0.5) c = darken(c, 0.18);
+      px(ctx, cx + dx, cy, c);
+    }
+    // Plank lines every 6 steps
+    if (i % 5 === 0) {
+      for (let dx = -w; dx <= w; dx++) px(ctx, cx + dx, cy, darken(PAL.woodDark, 0.1));
+    }
+    // Wet path reflections
+    if (light.rain > 0.4 && i % 3 === 0) {
+      px(ctx, cx, cy + 1, withAlpha(light.sky.horizon, 0.4));
+    }
+    prevX = cx; prevY = cy;
+  }
+}
+
+function drawBench(ctx, x, y, light) {
+  // Two wooden legs
+  fr(ctx, x,     y, 1, 5, PAL.woodDark);
+  fr(ctx, x + 8, y, 1, 5, PAL.woodDark);
+  // Seat (3 planks)
+  fr(ctx, x - 1, y - 1, 11, 1, PAL.woodLight);
+  fr(ctx, x - 1, y - 2, 11, 1, mix(PAL.woodLight, PAL.woodDark, 0.4));
+  // Back rest
+  fr(ctx, x - 1, y - 6, 11, 1, PAL.woodLight);
+  for (let i = 0; i < 4; i++) {
+    fr(ctx, x + 1 + i*2, y - 5, 1, 4, PAL.woodLight);
+  }
+  // Snow on bench
+  if (light.snow > 0.5) {
+    fr(ctx, x - 1, y - 3, 11, 1, '#e9eef2');
+    fr(ctx, x - 1, y - 7, 11, 1, '#e9eef2');
+  }
+}
+
+function drawDock(ctx, x, y, light, t) {
+  // 4 piles with planks on top
+  for (let i = 0; i < 4; i++) {
+    const px2 = x + i * 8;
+    fr(ctx, px2, y, 1, 6, PAL.woodDark);
+    fr(ctx, px2, y - 1, 1, 1, PAL.woodLight);
+  }
+  fr(ctx, x - 1, y, 26, 1, PAL.woodLight);
+  fr(ctx, x - 1, y - 1, 26, 1, PAL.woodDark);
+  // Gentle shimmer on water by dock
+  for (let dx = 0; dx < 26; dx += 3) {
+    const a = 0.3 + 0.2 * Math.sin(t * 0.005 + dx);
+    px(ctx, x + dx, y + 4, withAlpha(PAL.seaFoam, a * 0.5));
+  }
+}
+
+function drawGrassTufts(ctx, paraDx, light, t) {
+  for (let i = 0; i < 18; i++) {
+    const seed = i * 19 + 5;
+    const tx = (seed * 7) % W + paraDx * 0.4;
+    const ty = CLIFF_Y + 2 + (seed % 3);
+    const sway = Math.sin(t * 0.003 + i) * Math.min(2, light.wind * 0.6);
+    for (let dy = 0; dy < 3; dy++) {
+      px(ctx, tx + sway * dy * 0.4, ty - dy, light.snow > 0.5
+        ? mix(PAL.grassDeep, '#e6eaf0', 0.5) : PAL.grassDeep);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 5 — FIGURE (depth 1.0)
+// One solitary silhouette in heavy coat + scarf. Position varies with hour
+// and weather: stays near cabin in storm/heavy-rain, walks to bench in
+// clear/partly, sits on bench at dusk.
+// ════════════════════════════════════════════════════════════════
+function figurePosition(hour, weatherKind, paraDx) {
+  // hour 0..24. Returns { x, y, action: 'walk' | 'sit' | 'stand' | 'home' }
+  const stayHome = weatherKind === 'storm' || weatherKind === 'heavy-rain';
+  const onBench = (hour >= 17 && hour <= 19) && !stayHome;
+  const inside = (hour >= 22 || hour <= 5);
+
+  if (inside) return { x: 100, y: CLIFF_Y - 14, action: 'home' };
+  if (stayHome) {
+    // Pacing near cabin door
+    const sway = Math.sin(hour * 1.3) * 6;
+    return { x: 110 + sway, y: CLIFF_Y - 8, action: 'stand' };
+  }
+  if (onBench) return { x: 162 + paraDx * 0.8, y: CLIFF_Y + 4, action: 'sit' };
+
+  // Walking the path. Phase = 0..1 across the day's awake window.
+  // Linear y descent so the figure tracks the bezier path (cabin → bench →
+  // dock direction). Cap the y so they never sink below the path's last
+  // visible step.
+  const phase = ((hour - 6) % 12) / 12;
+  const px2 = 105 + phase * 110;
+  const py2 = CLIFF_Y - 10 + phase * 16;       // 120 → 136, stays above grass
+  return { x: px2, y: py2, action: 'walk' };
+}
+
+function drawFigure(ctx, light, t, paraDx, hour, weatherKind) {
+  const pos = figurePosition(hour, weatherKind, paraDx);
+  if (pos.action === 'home') return;  // figure is inside, window glows instead
+  const fx = pos.x | 0, fy = pos.y | 0;
+  const walkPhase = (t * 0.005) % 1;
+
+  // Long shadow at low sun
+  if (light.shadow.opacity > 0.05) {
+    const sLen = light.shadow.len;
+    for (let dx = 1; dx <= sLen; dx++) {
+      const taper = 1 - dx / sLen;
+      for (let dy = 0; dy < Math.max(1, taper * 2); dy++) {
+        if (((fx + dx + dy) & 1) === 0) {
+          px(ctx, fx + dx * light.shadow.signX, fy + 9 + dy,
+             withAlpha('#000000', light.shadow.opacity * taper));
+        }
+      }
+    }
+  }
+
+  // Coat color tinted by ambient (so figure isn't flat black)
+  const coat = mix(PAL.coatDark, light.ambient, 0.18);
+  const coatLit = mix(coat, light.cel.rim > 0.3 ? PAL.dawnPeach : light.ambient, light.cel.rim * 0.35);
+  const scarf = light.cel.rim > 0.2 ? mix(PAL.scarfRed, PAL.dawnPeach, light.cel.rim * 0.4) : PAL.scarfRed;
+  const skin = mix(PAL.skin, light.ambient, 0.2);
+  const hair = darken(coat, 0.3);
+
+  // Walk bob
+  const bob = pos.action === 'walk'
+    ? Math.round(Math.sin(walkPhase * Math.PI * 2) * 0.8)
+    : 0;
+
+  // Body proportions:
+  //   head: 3×3 px,  scarf: 4 wide,  coat body: 4 wide × 6 tall,  legs: 1×3 each
+  // The figure is ~10 px tall.
+  const cx = fx, cy = fy - bob;
+
+  // Sit posture variant — knees forward
+  if (pos.action === 'sit') {
+    // Seated — narrow body, no leg sway
+    fr(ctx, cx - 2, cy - 8, 4, 3, hair);     // head/hat
+    fr(ctx, cx - 1, cy - 6, 2, 1, skin);
+    fr(ctx, cx - 2, cy - 4, 5, 1, scarf);
+    fr(ctx, cx - 2, cy - 3, 4, 4, coat);
+    fr(ctx, cx - 2, cy - 3, 4, 1, coatLit);
+    // legs forward
+    fr(ctx, cx - 2, cy + 1, 5, 1, coat);
+    fr(ctx, cx - 2, cy + 2, 1, 1, PAL.coatDark);
+    fr(ctx, cx + 2, cy + 2, 1, 1, PAL.coatDark);
+    return;
+  }
+
+  // Standing / walking
+  // Head w/ scarf hood-edge
+  fr(ctx, cx - 1, cy - 9, 3, 3, hair);
+  px(ctx, cx,     cy - 7, skin);          // tiny face highlight
+  // Scarf — overhangs neck, with a 2-frame lag in walk for "follow-through"
+  const scarfDrift = pos.action === 'walk' ? Math.sin((walkPhase - 0.15) * Math.PI * 2) * 1.2 : 0;
+  fr(ctx, cx - 1, cy - 6, 3, 1, scarf);
+  px(ctx, cx + 1 + scarfDrift, cy - 5, scarf);
+  px(ctx, cx + 2 + scarfDrift, cy - 4, darken(scarf, 0.3));
+  // Coat body
+  fr(ctx, cx - 2, cy - 5, 4, 4, coat);
+  // Coat warm-side (rim light)
+  if (light.cel.rim > 0.2) {
+    fr(ctx, cx + 1, cy - 5, 1, 4, coatLit);
+  }
+  // Coat tail trailing in wind
+  if (light.wind > 1.0) {
+    const drag = Math.min(3, Math.round(light.wind * 0.7)) * (light.shadow.signX > 0 ? -1 : 1);
+    fr(ctx, cx - 2 - drag, cy - 1, 1, 2, coat);
+    px(ctx, cx - 2 - drag - 1, cy, coat);
+  }
+  // Belt
+  px(ctx, cx,     cy - 2, darken(coat, 0.5));
+  // Legs (walk anim — alternating)
+  const stride = pos.action === 'walk' ? Math.round(Math.sin(walkPhase * Math.PI * 2) * 1.5) : 0;
+  fr(ctx, cx - 1, cy - 1, 1, 3, PAL.coatDark);
+  fr(ctx, cx + 1, cy - 1, 1, 3, PAL.coatDark);
+  // Boot offset on lead leg
+  if (pos.action === 'walk') {
+    px(ctx, cx - 1 - Math.abs(stride), cy + 2, '#221a14');
+    px(ctx, cx + 1 + Math.abs(stride), cy + 2, '#221a14');
+  }
+
+  // Holding a tin mug at mid-shot in cold weather (wisp of steam)
+  if (light.windowGlow > 0.15 && weatherKind !== 'storm') {
+    px(ctx, cx + 2, cy - 2, '#a8a4a0');
+    if (Math.sin(t*0.01 + cx) > 0.3) {
+      px(ctx, cx + 3, cy - 4, withAlpha(PAL.cloudBright, 0.6));
+    }
+  }
+
+  // In fog/snow with lantern at night
+  if ((light.fog > 0.5 || (light.starDensity > 0.3 && pos.action === 'walk')) && weatherKind !== 'storm') {
+    const lx = cx + 3, ly = cy - 2;
+    fr(ctx, lx, ly, 1, 2, '#3c2818');
+    px(ctx, lx, ly + 1, PAL.windowGlow);
+    discPix(ctx, lx, ly + 1, 4, withAlpha(PAL.windowGlow, 0.18));
+    discPix(ctx, lx, ly + 1, 2, withAlpha(PAL.windowGlow, 0.45));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// LAYER 6 — LENS (foreground particles + vignette + lens FX)
+// ════════════════════════════════════════════════════════════════
+function drawParticles(ctx, light, t) {
+  // RAIN — terminal velocity, slight angle in wind
+  if (light.rain > 0.05) {
+    const count = Math.floor(120 * light.rain);
+    const angle = Math.min(0.55, light.wind * 0.18);
+    for (let i = 0; i < count; i++) {
+      const seed = i * 47 + 11;
+      const baseX = (seed * 13) % (W + 60) - 30;
+      const fall = (t * (90 + (seed % 30)) + i * 31) % (H + 40);
+      const xx = baseX + fall * angle;
+      // Speed lines (length grows with rain intensity)
+      const len = 2 + light.rain * 3;
+      for (let k = 0; k < len; k++) {
+        const yy = fall - k;
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
+          px(ctx, xx, yy, withAlpha(PAL.cloudBright, 0.4 + light.rain * 0.4));
+        }
+      }
+    }
+    // Splash near ground
+    for (let i = 0; i < 16 * light.rain; i++) {
+      const seed = i * 23 + 5;
+      const sx = (seed * 17 + Math.floor(t * 30)) % W;
+      if ((Math.floor(t / 6) + i) % 4 === 0) {
+        px(ctx, sx,     CLIFF_Y - 1, withAlpha(PAL.seaFoam, 0.6));
+        px(ctx, sx - 1, CLIFF_Y,     withAlpha(PAL.seaFoam, 0.4));
+        px(ctx, sx + 1, CLIFF_Y,     withAlpha(PAL.seaFoam, 0.4));
+      }
+    }
+    // Foreground "lens" rain — large streaked drops in front of camera
+    for (let i = 0; i < 6; i++) {
+      const seed = i * 17 + 1;
+      const xx = (seed * 23 + Math.floor(t * 60)) % W;
+      const yy = (seed * 11 + Math.floor(t * 200)) % H;
+      const a = 0.35 + light.rain * 0.3;
+      fr(ctx, xx, yy, 1, 4, withAlpha(PAL.cloudBright, a));
+      fr(ctx, xx + 1, yy + 1, 1, 2, withAlpha(PAL.cloudBright, a*0.6));
+    }
+  }
+
+  // SNOW — Perlin x-velocity, eddies. Catches window light.
+  if (light.snow > 0.05) {
+    const count = Math.floor(80 * light.snow);
+    for (let i = 0; i < count; i++) {
+      const seed = i * 39 + 3;
+      const driftPhase = t * 0.001 + seed * 0.07;
+      const baseX = (seed * 11) % W;
+      const baseY = ((seed * 17 + t * 30) % (H + 40)) - 20;
+      const xx = baseX + Math.sin(driftPhase) * 6 + pnoise1(driftPhase) * 3;
+      const yy = baseY;
+      if (yy < 0 || yy > H) continue;
+      // Catches window light
+      const winX = 95, winY = CLIFF_Y - 18;
+      const distWin = Math.hypot(xx - winX, yy - winY);
+      const warm = distWin < 25 ? Math.max(0, 1 - distWin/25) * light.windowGlow : 0;
+      const c = warm > 0.3
+        ? withAlpha(PAL.windowGlow, 0.7)
+        : withAlpha(PAL.cloudBright, 0.6 + light.snow * 0.3);
+      px(ctx, xx, yy, c);
+      if (i % 3 === 0) px(ctx, xx + 1, yy, c);
+    }
+  }
+
+  // FOG — horizontal drifting bands (not falling, drifting).
+  if (light.fog > 0.1) {
+    const bands = Math.floor(4 + light.fog * 5);
+    for (let b = 0; b < bands; b++) {
+      const yBand = HORIZON_Y - 6 + b * 6 + Math.sin(t * 0.0002 + b) * 2;
+      const drift = (t * (8 + b*2)) % (W + 60);
+      for (let x = -drift; x < W; x += 5 + (b % 3)) {
+        const a = light.fog * (0.25 + (b % 2) * 0.15);
+        for (let dx = 0; dx < 6; dx++) {
+          const xx = x + dx;
+          const yy = yBand + Math.sin(xx * 0.3 + b) * 0.5;
+          if (xx >= 0 && xx < W && yy >= 0 && yy < H)
+            px(ctx, xx, yy, withAlpha(PAL.fogBody, a));
+        }
+      }
+    }
+  }
+}
+
+function drawLensEffects(ctx, light, t, lightningFlashFrames) {
+  // Vignette — applied as a CSS radial-gradient overlay on the visible canvas
+  // so we don't pay 57k pixel ops per frame here.
+  // Heavy-rain "drops on the lens" — semi-static droplets that occasionally streak.
+  if (light.rain > 0.7) {
+    for (let i = 0; i < 6; i++) {
+      const seed = i * 71 + 11;
+      const dx = (seed * 19) % W;
+      const dy = (seed * 11) % H;
+      // streak down briefly
+      const s = (t / 8 + seed) % 60 < 10 ? 6 : 0;
+      discPix(ctx, dx, dy, 1, withAlpha(PAL.cloudBright, 0.4));
+      if (s) fr(ctx, dx, dy, 1, s, withAlpha(PAL.cloudBright, 0.25));
+    }
+  }
+  // Lightning flash — full-frame ink-white silhouette pass.
+  if (lightningFlashFrames > 0) {
+    fr(ctx, 0, 0, W, H, withAlpha('#f4f6f7', 0.55 + (lightningFlashFrames / 6) * 0.3));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// MAIN COMPONENT
+// ════════════════════════════════════════════════════════════════
+function CinemaDiorama({ s, dark }) {
+  const [dayIdx, setDayIdx] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const [muted, setMuted] = useState(true);  // audio is stubbed; mute is always-on default
+  const [t, setT] = useState(0);              // seconds elapsed in 90s loop
+  const [shotLabel, setShotLabel] = useState('WIDE');
+  const containerRef = useRef(null);
+  const visRef = useRef(null);
+  const offRef = useRef(null);
+  const lightningRef = useRef({ frames: 0, nextFire: 4 + Math.random() * 8 });
+
+  // Determine weather code per scene-time. We sample the selected day's hourly
+  // forecast to allow weather to vary across the 90-second loop, matching how
+  // a real day evolves.
+  const dayForecast = useMemo(() => {
+    const daily = (s.daily || [])[dayIdx];
+    const hourly = s.hourly || [];
+    const codesByHour = new Array(24).fill(daily?.code ?? 3);
+    if (dayIdx === 0 && hourly.length) {
+      hourly.slice(0, 24).forEach((h, i) => { codesByHour[i] = h.code; });
+    } else if (dayIdx === 1 && hourly.length >= 36) {
+      hourly.slice(12, 36).forEach((h, i) => { codesByHour[i] = h.code; });
+    }
+    return { codesByHour, daily };
+  }, [s, dayIdx]);
+
+  // rAF loop — drives `t` and renders. Decoupled so render runs even if React
+  // state updates throttle.
   useEffect(() => {
-    if (!active) return;
-    let raf, t0 = performance.now();
-    const loop = (now) => { setT(now - t0); raf = requestAnimationFrame(loop); };
+    const offC = document.createElement('canvas');
+    offC.width = W; offC.height = H;
+    offRef.current = offC;
+    const offCtx = offC.getContext('2d');
+    offCtx.imageSmoothingEnabled = false;
+
+    let raf, last = performance.now(), elapsed = 0, lastUiTick = 0;
+    const loop = (now) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      if (playing) elapsed = (elapsed + dt) % DAY_SECONDS;
+
+      const hour = (elapsed / DAY_SECONDS) * 24;
+      const hourIdx = Math.floor(hour) % 24;
+      const code = dayForecast.codesByHour[hourIdx];
+      const light = L.light(hour, code);
+      const cam = Cinema.camera(elapsed);
+
+      // Lightning state machine — fires only in storm.
+      if (light.lightning) {
+        lightningRef.current.nextFire -= dt;
+        if (lightningRef.current.nextFire <= 0) {
+          lightningRef.current.frames = 6;
+          lightningRef.current.nextFire = 4 + Math.random() * 9;
+        }
+      }
+      const lf = lightningRef.current.frames;
+      if (lightningRef.current.frames > 0) lightningRef.current.frames--;
+
+      // Per-layer parallax — depth multiplier on (cam - center)
+      const camDx = cam.cx - W/2;
+      const camDy = cam.cy - H/2;
+
+      // Defensive: re-assert canvas dimensions every frame.
+      if (offC.width !== 320) offC.width = 320;
+      if (offC.height !== 180) offC.height = 180;
+      const visEl = visRef.current;
+      if (visEl && containerRef.current) {
+        const cw = containerRef.current.offsetWidth | 0;
+        const targetH = Math.round(cw * 180 / 320);
+        if (cw >= 10) {
+          if (visEl.width !== cw) visEl.width = cw;
+          if (visEl.height !== targetH) visEl.height = targetH;
+          if (visEl.style.width !== cw + 'px') visEl.style.width = cw + 'px';
+          if (visEl.style.height !== targetH + 'px') visEl.style.height = targetH + 'px';
+        }
+      }
+
+      // Render to off-canvas at logical resolution
+      offCtx.clearRect(0, 0, W, H);
+      drawSky(offCtx, light, elapsed * 1000);
+      drawSea(offCtx, light, elapsed * 1000, camDx * 0.15);
+      drawPines(offCtx, light, elapsed * 1000, camDx * 0.35, camDy * 0.35);
+      drawMidground(offCtx, light, elapsed * 1000, camDx * 0.7, camDy * 0.7);
+      drawFigure(offCtx, light, elapsed * 1000, camDx * 1.0, hour, light.kind);
+      drawParticles(offCtx, light, elapsed * 1000);
+      drawLensEffects(offCtx, light, elapsed * 1000, lf);
+
+      // Blit to visible with zoom — guarded against 0-sized canvases (layout race)
+      const vis = visRef.current;
+      const canBlit = vis && vis.width > 0 && vis.height > 0 && offC.width > 0 && offC.height > 0;
+      if (canBlit) {
+        const vctx = vis.getContext('2d');
+        vctx.imageSmoothingEnabled = false;
+        vctx.fillStyle = '#000';
+        vctx.fillRect(0, 0, vis.width, vis.height);
+        const z = cam.zoom;
+        const sx = vis.width / W, sy = vis.height / H;
+        vctx.save();
+        vctx.translate(vis.width / 2, vis.height / 2);
+        vctx.scale(sx * z, sy * z);
+        vctx.translate(-cam.cx, -cam.cy);
+        vctx.drawImage(offC, 0, 0);
+        vctx.restore();
+      } else if (!window.__diorama_warned) {
+        window.__diorama_warned = true;
+        console.warn('[diorama] skipping blit — vis=', vis?.width, 'x', vis?.height, ' offC=', offC.width, 'x', offC.height);
+      }
+
+      // Update React state ~3x/sec so the UI hour/shot readouts feel live but
+      // we don't thrash the React tree at 60fps.
+      if (now - lastUiTick > 333) {
+        lastUiTick = now;
+        setT(elapsed);
+        if (cam.shot !== shotLabel) setShotLabel(cam.shot);
+      }
+      raf = requestAnimationFrame(loop);
+    };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [active]);
-  return t;
-}
+  }, [playing, dayForecast]);
 
-// rAF canvas that calls draw(c, tick, w, h) and resizes with parent
-function PixCanvasAuto({ height, draw, deps = [], scale = 5, maxLogicalW = 600, minLogicalW = 80 }) {
-  const ref = useRef(null);
-  const [w, setW] = useState(900);
+  // Resize visible canvas to parent width with 16:9 aspect
   useEffect(() => {
-    const update = () => { if (ref.current?.parentElement) setW(ref.current.parentElement.offsetWidth); };
-    update();
-    const ro = new ResizeObserver(update);
-    if (ref.current?.parentElement) ro.observe(ref.current.parentElement);
-    window.addEventListener('resize', update);
-    return () => { ro.disconnect(); window.removeEventListener('resize', update); };
-  }, []);
-  useEffect(() => {
-    if (!ref.current) return;
-    const c = ref.current;
-    const W2 = Math.min(maxLogicalW, Math.max(minLogicalW, Math.floor(w / scale)));
-    const H2 = Math.floor(height / scale);
-    c.width = W2 * scale; c.height = H2 * scale; c._w = W2; c._h = H2; c._s = scale;
-    const ctx = c.getContext('2d'); ctx.imageSmoothingEnabled = false;
-    let raf;
-    const render = (now) => {
-      Dw.clear(c, 'rgba(0,0,0,0)');
-      draw(c, now * 0.06, W2, H2);
-      raf = requestAnimationFrame(render);
+    const vis = visRef.current;
+    const onResize = () => {
+      if (!vis || !containerRef.current) return;
+      const cw = containerRef.current.offsetWidth;
+      if (cw < 10) return;  // parent not laid out yet — ResizeObserver will retry
+      vis.width = cw;
+      vis.height = Math.round(cw * (H / W));
+      vis.style.width = cw + 'px';
+      vis.style.height = Math.round(cw * (H / W)) + 'px';
     };
-    raf = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(raf);
-  }, [w, height, scale, ...deps]);
-  return <canvas ref={ref} style={{ imageRendering: 'pixelated', width: '100%', height, display: 'block' }} />;
-}
+    onResize();
+    window.addEventListener('resize', onResize);
+    const ro = new ResizeObserver(onResize);
+    if (containerRef.current) ro.observe(containerRef.current);
+    return () => { window.removeEventListener('resize', onResize); ro.disconnect(); };
+  }, []);
 
-// ── MODE A · STORYBOARD (cinematic frames of the day) ───────────────────────
-// Each panel is a wide cinemascope frame with rich, weather-specific scenery.
-// Hours that fall after dusk override clear/cloud kinds with a stargazing scene.
-
-// shared per-panel helpers
-const KIND_WIND = { sun: 6, 'sun-cloud': 9, cloud: 5, fog: 2, rain: 14, snow: 4, storm: 22 };
-function dwShadowLen(hour) {
-  // morning: long shadow to the LEFT (sun in east). evening: long to the RIGHT.
-  // noon: ~zero. clamped.
-  const h = hour - 12;
-  return Math.max(-12, Math.min(12, Math.round(h * 1.6)));
-}
-function dwShadow(c, x, groundY, len) {
-  if (!len) return;
-  const sign = len > 0 ? 1 : -1, n = Math.abs(len);
-  for (let dx = 1; dx <= n; dx++) {
-    const t = dx / n;
-    const halfH = Math.max(1, Math.floor((1 - t) * 1.4));
-    for (let dy = 0; dy < halfH; dy++) {
-      const px = x + sign * dx, py = groundY + dy;
-      if (((px + py) & 1) === 0) Dw.px(c, px, py);
-    }
-  }
-}
-function dwFlag(c, fx, fy, wind, tick) {
-  const acc = Dw.getAccent();
-  for (let dy = 0; dy < 14; dy++) Dw.px(c, fx, fy + dy);
-  const ext = Math.max(2, Math.min(11, Math.floor(wind * 0.5 + 2)));
-  for (let dx = 1; dx <= ext; dx++) {
-    const ripple = Math.floor(Math.sin((tick + dx * 8) * 0.08) * Math.min(2, dx * 0.3));
-    for (let dy = 0; dy < 4; dy++) Dw.px(c, fx + dx, fy + dy + ripple, dx === ext ? acc : null);
-  }
-}
-function dwWindowLights(c, W, groundY, count) {
-  const acc = Dw.getAccent();
-  for (let i = 0; i < count; i++) {
-    const x = (i * 19 + 5) % W;
-    const y = groundY - 8 - ((i * 7) % 26);
-    if ((i * 13) % 5 < 3) { Dw.px(c, x, y, acc); Dw.px(c, x + 1, y, acc); }
-  }
-}
-function dwReflection(c, W, groundY, h) {
-  // dithered band below ground line for wet pavement
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < W; x++) {
-      const bx = ((x % 8)+8)%8, by = ((y%8)+8)%8;
-      const fade = 0.45 - y / h * 0.4;
-      if (Dw.BAYER8[by*8+bx] < fade && ((x * 13 + 7) % 5) < 3) {
-        Dw.px(c, x, groundY + 2 + y);
-      }
-    }
-  }
-}
-function dwFootprints(c, x0, x1, groundY) {
-  const a = Math.min(x0, x1), b = Math.max(x0, x1);
-  for (let x = a; x < b; x += 4) {
-    Dw.px(c, x, groundY); Dw.px(c, x + 1, groundY);
-    Dw.px(c, x, groundY - 1);
-  }
-}
-function dwBreath(c, x, y, tick, idx) {
-  const t = ((tick * 0.04 + idx * 23) % 26) / 26;
-  if (t < 0.05) return;
-  const px = Math.round(x + t * 6);
-  const py = Math.round(y - t * 5);
-  const r = Math.floor(t * 2.5) + 1;
-  Dw.pxCircle(c, px, py, r, null, false);
-}
-function dwBgPaceSpeed(kind) {
-  return ({ rain: 0.6, storm: 0, snow: 0.18, fog: 0.22, sun: 0.32, cloud: 0.18, 'sun-cloud': 0.3 })[kind] ?? 0.28;
-}
-
-function renderStoryPanel(c, W, H, tick, kind, hour, isLive) {
-  const acc = Dw.getAccent();
-  const night = hour >= 20 || hour < 5;
-  const dawn = hour >= 5 && hour < 8;
-  const dusk = hour >= 18 && hour < 21;
-
-  if (night && (kind === 'sun' || kind === 'sun-cloud' || kind === 'cloud')) {
-    drawNightPanel(c, W, H, tick, hour); return;
-  }
-  if (dawn || dusk) {
-    const groundY = H - Math.floor(H * 0.18);
-    for (let y = 0; y < groundY - 6; y++) {
-      const top = y / Math.max(1, groundY - 6);
-      for (let x = 0; x < W; x++) {
-        const bx = ((x % 8)+8)%8, by = ((y%8)+8)%8;
-        if (Dw.BAYER8[by*8+bx] < (1 - top) * 0.22) Dw.px(c, x, y, acc);
-      }
-    }
-  }
-
-  if      (kind === 'sun')        drawSunPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'sun-cloud')  drawSunCloudPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'cloud')      drawCloudPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'fog')        drawFogPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'rain')       drawRainPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'snow')       drawSnowPanel(c, W, H, tick, hour, isLive);
-  else if (kind === 'storm')      drawStormPanel(c, W, H, tick, hour, isLive);
-  else                            drawCloudPanel(c, W, H, tick, hour, isLive);
-}
-
-function drawSunPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  // big sun + rotating rays
-  const sunX = Math.floor(W * 0.82), sunY = Math.floor(H * 0.25);
-  Dw.drawSun(c, sunX, sunY, 7, tick * 0.001);
-  for (let r = 0; r < 12; r++) {
-    const a = (r / 12) * Math.PI * 2 + tick * 0.0006;
-    for (let d = 13; d < 22; d++) if (d % 2 === 0) {
-      const x = Math.round(sunX + Math.cos(a) * d);
-      const y = Math.round(sunY + Math.sin(a) * d);
-      if (x >= 0 && x < W && y >= 0 && y < groundY) Dw.px(c, x, y, acc);
-    }
-  }
-  Dw.drawCloud(c, Math.floor(W * 0.18), Math.floor(H * 0.16), 12, 6);
-  Dw.drawCloud(c, Math.floor(W * 0.4),  Math.floor(H * 0.1), 8, 4);
-  WS.birdsFlight(c, W, tick, 4);
-  // distant hills via dither triangles
-  for (let i = 0; i < 3; i++) {
-    const mx = Math.floor(W * (0.18 + i * 0.3)), mh = 12 - i * 2;
-    for (let dx = -mh; dx <= mh; dx++) for (let dy = 0; dy < mh - Math.abs(dx); dy++) {
-      const bx = (((mx+dx) % 6) + 6) % 6, by = (((groundY - 4 - dy) % 6) + 6) % 6;
-      if (Dw.BAYER8[by*8+bx] < 0.4) Dw.px(c, mx + dx, groundY - 4 - dy);
-    }
-  }
-  WS.skyline(c, 0, groundY - 2, W, 7);
-  WS.ground(c, W, H, 'grass');
-  // wheat field
-  for (let x = 0; x < W; x += 2) {
-    const h = 2 + Math.floor((Math.sin(x * 0.4) + 1) * 1.5);
-    for (let dy = 0; dy < h; dy++) Dw.px(c, x, groundY - 1 - dy);
-    if (x % 6 === 0) Dw.px(c, x, groundY - h - 1, acc);
-  }
-  WS.bigTree(c, Math.floor(W * 0.06), groundY - 2);
-  WS.picketFence(c, Math.floor(W * 0.78), Math.floor(W * 0.95), groundY);
-  // wind flag on far rooftop
-  dwFlag(c, Math.floor(W * 0.7), Math.floor(H * 0.42), KIND_WIND.sun, tick);
-  // kite — flown by GIRL now (shared verbs across scenes)
-  const kx = Math.floor(W * 0.45), ky = Math.floor(H * 0.22);
-  WS.blit(c, kx, ky, WS.PROPS.kite);
-  for (let q = 0; q < 6; q++) {
-    const tx = Math.round(kx + 5 + Math.sin(tick * 0.04 + q) * 2);
-    const ty = ky + 9 + q * 2;
-    if (q % 2 === 0) Dw.px(c, tx, ty, acc); else Dw.px(c, tx, ty);
-  }
-  const gx = Math.floor(W * 0.4), bx = Math.floor(W * 0.6);
-  for (let t = 0; t <= 1; t += 0.04) {
-    const sx = Math.round(kx + 5 + (gx + 4 - kx - 5) * t);
-    const sy = Math.round(ky + 8 + (personY + 4 - ky - 8) * t);
-    if (Math.floor(t * 20) % 2 === 0) Dw.px(c, sx, sy);
-  }
-  // long character shadows angled by time of day
-  const sLen = dwShadowLen(hour);
-  dwShadow(c, gx + 4, groundY, sLen);
-  dwShadow(c, bx + 4, groundY, sLen);
-  WS.drawPerson(c, gx, personY, 'girl', 'cheer', 0);
-  // boy walks alongside with the dog at his heel
-  WS.drawPerson(c, bx, personY, 'boy', 'walk', f);
-  WS.dog(c, bx + 12, groundY, f);
-  // butterflies
-  for (let i = 0; i < 3; i++) {
-    const bxx = ((Math.floor(tick * 0.3 + i * 50)) % (W + 30)) - 15;
-    const byy = Math.floor(personY - 8 + Math.sin((tick + i*30) * 0.04) * 6);
-    Dw.px(c, bxx, byy, acc); Dw.px(c, bxx + 1, byy, acc);
-  }
-}
-
-function drawSunCloudPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  Dw.drawSun(c, Math.floor(W * 0.7), Math.floor(H * 0.22), 6, tick * 0.001);
-  // drifting clouds — visibly travel left across the sky
-  const drift = Math.floor((tick * 0.3));
-  const dC = (base) => ((base - drift) % (W + 60) + (W + 60)) % (W + 60) - 30;
-  Dw.drawCloud(c, dC(Math.floor(W * 0.74)), Math.floor(H * 0.24), 16, 8);
-  Dw.drawCloud(c, dC(Math.floor(W * 0.25)), Math.floor(H * 0.18), 14, 7);
-  Dw.drawCloud(c, dC(Math.floor(W * 0.45)), Math.floor(H * 0.1),  10, 5);
-  // god rays — diagonal accent dotted
-  for (let r = 0; r < 5; r++) {
-    const startX = Math.floor(W * 0.66 + r * 4), startY = Math.floor(H * 0.32);
-    for (let d = 0; d < 26; d++) {
-      const x = startX - Math.floor(d * 0.6), y = startY + d;
-      if (d % 3 === 0 && x >= 0 && y < groundY) Dw.px(c, x, y, acc);
-    }
-  }
-  WS.skyline(c, 0, groundY - 4, W, 17);
-  WS.ground(c, W, H, 'grass');
-  // moving cloud-shadow patch sweeping across the ground
-  const shx = ((Math.floor(tick * 0.35)) % (W + 60)) - 30;
-  for (let dx = 0; dx < 28; dx++) for (let dy = 0; dy < 2; dy++) {
-    if ((dx + dy) % 2 === 0) Dw.px(c, shx + dx, groundY - 2 - dy);
-  }
-  // dotted center path
-  const vpX = Math.floor(W * 0.5);
-  for (let i = 0; i < 12; i++) {
-    const t = i / 12, py = groundY - Math.floor(t * Math.floor(H * 0.2));
-    Dw.px(c, vpX, py); Dw.px(c, vpX + 1, py);
-  }
-  WS.picketFence(c, Math.floor(W * 0.05), Math.floor(W * 0.32), groundY);
-  WS.picketFence(c, Math.floor(W * 0.68), Math.floor(W * 0.95), groundY);
-  WS.bigTree(c, Math.floor(W * 0.92), groundY - 2);
-  WS.shrub(c, Math.floor(W * 0.15), groundY - 1, 3);
-  WS.shrub(c, Math.floor(W * 0.85), groundY - 1, 3);
-  // wind flag on right building
-  dwFlag(c, Math.floor(W * 0.9), Math.floor(H * 0.34), KIND_WIND['sun-cloud'], tick);
-  // softer time-of-day shadows
-  const sLen2 = Math.round(dwShadowLen(hour) * 0.6);
-  dwShadow(c, Math.floor(W * 0.45) + 4, groundY, sLen2);
-  dwShadow(c, Math.floor(W * 0.55) + 4, groundY, sLen2);
-  WS.drawPerson(c, Math.floor(W * 0.45), personY, 'boy', 'walk', f);
-  WS.drawPerson(c, Math.floor(W * 0.55), personY, 'girl', 'walk', (f+1)%2);
-  // hand-holding accent dot between them
-  Dw.px(c, Math.floor(W * 0.5), personY + 8, acc);
-  Dw.px(c, Math.floor(W * 0.5) + 1, personY + 8, acc);
-  const bgX = (Math.floor(tick * dwBgPaceSpeed('sun-cloud')) % (W + 60)) - 30;
-  WS.backgroundFigure(c, bgX, groundY, 'walk', f);
-  WS.birdsFlight(c, W, tick, 2);
-}
-
-function drawCloudPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  // dense overcast — overlapping clouds
-  Dw.drawCloud(c, Math.floor(W * 0.18), Math.floor(H * 0.12), 18, 8);
-  Dw.drawCloud(c, Math.floor(W * 0.45), Math.floor(H * 0.16), 22, 10);
-  Dw.drawCloud(c, Math.floor(W * 0.78), Math.floor(H * 0.1),  18, 8);
-  Dw.drawCloud(c, Math.floor(W * 0.3),  Math.floor(H * 0.22), 16, 7);
-  Dw.drawCloud(c, Math.floor(W * 0.7),  Math.floor(H * 0.26), 14, 6);
-  WS.birdsFlight(c, W, tick, 3);
-  WS.skyline(c, 0, groundY - 4, W, 23);
-  // overcast = interior lights on in distant buildings
-  dwWindowLights(c, W, groundY, 28);
-  WS.ground(c, W, H, 'grass');
-  // bench with girl reading
-  const benchX = Math.floor(W * 0.4);
-  WS.parkBench(c, benchX, groundY);
-  WS.drawPerson(c, benchX + 2, groundY - 12, 'girl', 'sit', 0);
-  Dw.pxRect(c, benchX + 4, groundY - 8, 4, 2);
-  // boy pointing up
-  const boyX = Math.floor(W * 0.62);
-  WS.drawPerson(c, boyX, personY, 'boy', 'cheer', 0);
-  // dog
-  WS.dog(c, Math.floor(W * 0.2), groundY, f);
-  WS.picketFence(c, Math.floor(W * 0.05), Math.floor(W * 0.28), groundY);
-  WS.picketFence(c, Math.floor(W * 0.72), Math.floor(W * 0.95), groundY);
-  WS.cat(c, Math.floor(W * 0.85), groundY - 5, f);
-  WS.lamppost(c, Math.floor(W * 0.78), groundY);
-  WS.shrub(c, Math.floor(W * 0.15), groundY - 1, 3);
-  // limp wind flag (overcast = low wind correlation here)
-  dwFlag(c, Math.floor(W * 0.93), Math.floor(H * 0.36), KIND_WIND.cloud, tick);
-  // slow background pedestrian, contemplative pace
-  const bgC = (Math.floor(tick * dwBgPaceSpeed('cloud')) % (W + 60)) - 30;
-  WS.backgroundFigure(c, bgC, groundY, 'walk', f);
-}
-
-function drawFogPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  // ghostly trees
-  for (let i = 0; i < 4; i++) {
-    const tx = Math.floor(W * (0.1 + i * 0.27)), th = 14 + (i % 2) * 4;
-    for (let dy = 0; dy < th; dy++) if (dy % 3 === 0) Dw.px(c, tx, groundY - dy);
-    Dw.pxCircle(c, tx, groundY - th + 1, 4, null, false);
-  }
-  // distant skyline barely visible — depth fog
-  for (let i = 0; i < 60; i++) {
-    const x = (i * 11) % W, y = groundY - 4 - ((i * 5) % 12);
-    if (i % 3 === 0) Dw.px(c, x, y);
-  }
-  WS.ground(c, W, H, 'grass');
-  // 2 lit lampposts with halos
-  const lp1 = Math.floor(W * 0.22), lp2 = Math.floor(W * 0.78);
-  WS.lamppost(c, lp1, groundY);
-  WS.lamppost(c, lp2, groundY);
-  Dw.pxCircleDither(c, lp1, groundY - 26, 8, acc, () => 0.4);
-  Dw.pxCircleDither(c, lp2, groundY - 26, 8, acc, () => 0.4);
-  // fog bands rolling
-  WS.fogBands(c, W, H, tick);
-  // boy & girl close, sharing a lantern
-  const cx = Math.floor(W * 0.5);
-  WS.drawPerson(c, cx - 5, personY, 'boy', 'walk', f);
-  WS.drawPerson(c, cx + 5, personY, 'girl', 'walk', f);
-  Dw.pxRect(c, cx, personY + 6, 3, 4, acc);
-  Dw.pxCircleDither(c, cx + 1, personY + 7, 8, acc, () => 0.3);
-  // owl peering from a branch
-  const owlX = Math.floor(W * 0.86), owlY = Math.floor(H * 0.42);
-  Dw.pxRect(c, owlX, owlY, 4, 5);
-  Dw.px(c, owlX, owlY, acc); Dw.px(c, owlX + 3, owlY, acc);
-  // figures pop in/out of fog
-  const phase = Math.floor(tick / 80) % 4;
-  if (phase < 2) WS.backgroundFigure(c, Math.floor(W * 0.12), groundY, 'walk', f);
-  if (phase === 1) WS.backgroundFigure(c, Math.floor(W * 0.88), groundY, 'walk', f);
-}
-
-function drawRainPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  Dw.drawCloud(c, Math.floor(W * 0.25), Math.floor(H * 0.14), 20, 9);
-  Dw.drawCloud(c, Math.floor(W * 0.55), Math.floor(H * 0.12), 24, 11);
-  Dw.drawCloud(c, Math.floor(W * 0.85), Math.floor(H * 0.18), 18, 8);
-  Dw.drawCloud(c, Math.floor(W * 0.4),  Math.floor(H * 0.24), 16, 7);
-  // angled rain when wind is strong
-  const wind = KIND_WIND.rain;
-  const skew = wind > 10 ? 0.4 : 0;
-  for (let i = 0; i < W; i++) {
-    if (i % 3 !== 0) continue;
-    const baseY = ((tick * 1.4 + i * 7) | 0) % (groundY - 2);
-    const xx = i + Math.floor(baseY * skew);
-    Dw.px(c, xx, baseY); Dw.px(c, xx, baseY + 1);
-  }
-  WS.skyline(c, 0, groundY - 4, W, 13);
-  WS.ground(c, W, H, 'wet');
-  // wet pavement reflection
-  dwReflection(c, W, groundY, Math.min(8, H - groundY - 4));
-  // streetlamp lit
-  const lpX = Math.floor(W * 0.16);
-  WS.lamppost(c, lpX, groundY);
-  Dw.pxCircleDither(c, lpX, groundY - 26, 8, acc, () => 0.3);
-  // big puddles with ripples
-  for (let i = 0; i < 3; i++) {
-    const px = Math.floor(W * (0.28 + i * 0.22));
-    WS.puddle(c, px - 6, groundY, 12);
-    const r = (Math.floor(tick * 0.1) + i * 3) % 5 + 1;
-    Dw.pxCircle(c, px, groundY + 1, r, null, false);
-  }
-  // boy & girl together under big umbrella
-  const cx = Math.floor(W * 0.55);
-  // wider umbrella canopy
-  WS.blit(c, cx - 5, personY - 8, WS.PROPS.umbrella);
-  for (let dx = -8; dx <= 8; dx++) Dw.px(c, cx + dx, personY - 5);
-  for (let dx = -7; dx <= 7; dx++) Dw.px(c, cx + dx, personY - 6);
-  for (let dx = -5; dx <= 5; dx++) Dw.px(c, cx + dx, personY - 7);
-  for (let dy = 0; dy < 7; dy++) Dw.px(c, cx, personY - 4 + dy);
-  WS.drawPerson(c, cx - 5, personY, 'boy', 'idle', 0);
-  WS.drawPerson(c, cx + 3, personY, 'girl', 'idle', 0);
-  // awning + drip at left
-  const awnX = Math.floor(W * 0.06);
-  for (let dx = 0; dx < 22; dx++) Dw.px(c, awnX + dx, groundY - 22);
-  for (let dx = 0; dx < 24; dx++) Dw.px(c, awnX + dx, groundY - 23);
-  const dripT = Math.floor((tick * 0.3) % 16);
-  Dw.px(c, awnX + 21, groundY - 22 + dripT, acc);
-  // hurried bg pedestrian also under umbrella
-  const bgX = (Math.floor(tick * dwBgPaceSpeed('rain')) % (W + 30)) - 15;
-  WS.backgroundFigure(c, bgX, groundY, 'walk', f);
-  for (let dx = -3; dx < 4; dx++) Dw.px(c, bgX + dx, groundY - 9);
-  Dw.px(c, bgX + 1, groundY - 8); Dw.px(c, bgX + 2, groundY - 8);
-  // drainpipe with flowing water
-  const dpX = Math.floor(W * 0.05);
-  for (let dy = 0; dy < 22; dy++) Dw.px(c, dpX, groundY - 4 - dy);
-  for (let dy = 0; dy < 18; dy++) {
-    if ((dy + Math.floor(tick * 0.4)) % 2 === 0)
-      Dw.px(c, dpX + 1, groundY - dy, acc);
-  }
-  Dw.px(c, dpX - 1, groundY, acc); Dw.px(c, dpX + 2, groundY, acc);
-  Dw.px(c, dpX, groundY + 1, acc); Dw.px(c, dpX + 1, groundY + 1, acc);
-}
-
-function drawSnowPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  const f = Math.floor(tick/12) % 2;
-  // soft overcast
-  Dw.drawCloud(c, Math.floor(W * 0.2),  Math.floor(H * 0.12), 16, 7);
-  Dw.drawCloud(c, Math.floor(W * 0.55), Math.floor(H * 0.14), 22, 10);
-  Dw.drawCloud(c, Math.floor(W * 0.85), Math.floor(H * 0.1),  14, 6);
-  // snow-capped hills
-  for (let i = 0; i < 2; i++) {
-    const mx = Math.floor(W * (0.22 + i * 0.42)), mh = 16 - i * 2;
-    for (let dx = -mh; dx <= mh; dx++) {
-      const colH = mh - Math.abs(dx);
-      for (let dy = 0; dy < colH; dy++) {
-        const bx = (((mx+dx) % 6) + 6) % 6, by = (((groundY - 4 - dy) % 6) + 6) % 6;
-        if (Dw.BAYER8[by*8+bx] < 0.3) Dw.px(c, mx + dx, groundY - 4 - dy);
-      }
-      if (colH >= 5) for (let dy = colH - 3; dy < colH; dy++) Dw.px(c, mx + dx, groundY - 4 - dy);
-    }
-  }
-  WS.skyline(c, 0, groundY - 4, W, 41);
-  // snow caps along skyline tops
-  for (let x = 0; x < W; x += 12) {
-    const y = groundY - 12 - ((x * 7) % 6);
-    Dw.px(c, x, y - 1); Dw.px(c, x + 1, y - 1); Dw.px(c, x + 2, y - 1);
-  }
-  // chimney smoke (rising)
-  for (let i = 0; i < 6; i++) {
-    const ph = ((tick * 0.4 + i * 30) % 60) / 60;
-    const sx = Math.floor(W * 0.32) + Math.floor(Math.sin(ph * 6) * 2);
-    const sy = Math.floor(H * 0.28) - Math.floor(ph * 12);
-    if (sy > 0) Dw.px(c, sx, sy);
-  }
-  WS.ground(c, W, H, 'snow');
-  WS.snowdrift(c, W, groundY);
-  // pine trees with snow caps
-  for (let i = 0; i < 3; i++) {
-    const tx = Math.floor(W * (0.08 + i * 0.42));
-    for (let dy = 0; dy < 5; dy++) Dw.px(c, tx, groundY - 2 - dy);
-    for (let layer = 0; layer < 3; layer++) {
-      const ly = groundY - 6 - layer * 3, lw = 4 - layer;
-      for (let dx = -lw; dx <= lw; dx++) Dw.px(c, tx + dx, ly);
-      for (let dx = -lw + 1; dx <= lw - 1; dx++) Dw.px(c, tx + dx, ly - 1);
-    }
-  }
-  // FENCE + snow caps
-  WS.picketFence(c, Math.floor(W * 0.78), Math.floor(W * 0.95), groundY);
-  for (let x = Math.floor(W * 0.78); x <= Math.floor(W * 0.95); x += 4) {
-    Dw.px(c, x, groundY - 7); Dw.px(c, x - 1, groundY - 6);
-  }
-  // LAMPPOST + snow on crown
-  const lpsX = Math.floor(W * 0.06);
-  WS.lamppost(c, lpsX, groundY);
-  Dw.px(c, lpsX - 2, groundY - 31); Dw.px(c, lpsX - 1, groundY - 31);
-  Dw.px(c, lpsX, groundY - 31); Dw.px(c, lpsX + 1, groundY - 31); Dw.px(c, lpsX + 2, groundY - 31);
-  // snowman center — both kids are building it together
-  const smX = Math.floor(W * 0.5);
-  WS.blit(c, smX - 5, groundY - 10, WS.PROPS.snowman);
-  Dw.px(c, smX, groundY - 6, acc); Dw.px(c, smX + 1, groundY - 6, acc);
-  // boy rolling a snowball
-  const bx = Math.floor(W * 0.32);
-  WS.drawPerson(c, bx, personY, 'boy', 'idle', 0);
-  Dw.pxCircle(c, bx + 9, groundY - 1, 2, null, false);
-  // girl stacking / cheering
-  const gx = Math.floor(W * 0.66);
-  WS.drawPerson(c, gx, personY, 'girl', 'cheer', 0);
-  // FOOTPRINTS trailing each
-  dwFootprints(c, bx + 4, bx - 18, groundY);
-  dwFootprints(c, gx + 4, gx + 22, groundY);
-  // BREATH puffs
-  dwBreath(c, bx + 5, personY + 4, tick, 0);
-  dwBreath(c, gx + 5, personY + 4, tick, 1);
-  WS.snowParticles(c, W, H, tick);
-  // dog + paw prints behind it
-  const dgx = Math.floor(W * 0.85);
-  WS.dog(c, dgx, groundY, f);
-  for (let i = 1; i < 6; i++) Dw.px(c, dgx - i * 3, groundY);
-}
-
-function drawStormPanel(c, W, H, tick, hour, isLive) {
-  const acc = Dw.getAccent();
-  // wall stipple
-  for (let y = 4; y < H - 4; y += 4) for (let x = 0; x < W; x += 6) Dw.px(c, x + (y%2), y);
-  const floorY = H - Math.floor(H * 0.12);
-  for (let x = 0; x < W; x++) Dw.px(c, x, floorY);
-  for (let i = 1; i < 6; i++) {
-    const fx = Math.floor((i / 6) * W);
-    for (let yy = floorY + 1; yy < H; yy += 2) Dw.px(c, fx, yy);
-  }
-  // bookshelf left
-  const bsX = Math.floor(W * 0.04), bsY = Math.floor(H * 0.18);
-  Dw.pxRect(c, bsX, bsY, 22, floorY - bsY);
-  for (let s = 0; s < 4; s++) {
-    const sy = bsY + 6 + s * 8;
-    for (let x = 0; x <= 22; x++) Dw.px(c, bsX + x, sy);
-    for (let b = 0; b < 6; b++) {
-      const bx2 = bsX + 1 + b * 3, bh = 4 + (b % 3);
-      for (let yy = 0; yy < bh; yy++) {
-        Dw.px(c, bx2, sy - 1 - yy);
-        if (b % 2 === 0) Dw.px(c, bx2 + 1, sy - 1 - yy, acc);
-      }
-    }
-  }
-  // window with rain + lightning
-  const wx = Math.floor(W * 0.36), wy = Math.floor(H * 0.18);
-  const ww = Math.floor(W * 0.34), wh = Math.floor(H * 0.5);
-  for (let x = 0; x <= ww; x++) { Dw.px(c, wx + x, wy); Dw.px(c, wx + x, wy + wh); }
-  for (let y = 0; y <= wh; y++) { Dw.px(c, wx, wy + y); Dw.px(c, wx + ww, wy + y); }
-  for (let x = 1; x < ww; x++) Dw.px(c, wx + x, wy + Math.floor(wh/2));
-  for (let y = 1; y < wh; y++) Dw.px(c, wx + Math.floor(ww/2), wy + y);
-  // dark sky outside via dither
-  for (let y = wy + 1; y < wy + wh; y++) for (let x = wx + 1; x < wx + ww; x++) {
-    const bx = ((x % 8)+8)%8, by = ((y%8)+8)%8;
-    if (Dw.BAYER8[by*8+bx] < 0.45) Dw.px(c, x, y);
-  }
-  // tree outside the window swaying in the storm wind
-  const sway = Math.floor(Math.sin(tick * 0.06) * 2);
-  const tox = wx + Math.floor(ww * 0.22), toy = wy + wh - 6;
-  for (let dy = 0; dy < 18; dy++) {
-    const t = dy / 18;
-    Dw.px(c, tox + Math.floor(sway * t), toy - dy);
-  }
-  Dw.pxCircle(c, tox + sway, toy - 18, 4, null, false);
-  // lightning flash — lights the WHOLE pane and casts a glow into the room
-  const flashing = Math.floor(tick / 60) % 4 === 0 && (tick % 60) < 12;
-  if (flashing) {
-    for (let y = wy + 1; y < wy + wh; y++) for (let x = wx + 1; x < wx + ww; x++) {
-      const bx = ((x % 8)+8)%8, by = ((y%8)+8)%8;
-      if (Dw.BAYER8[by*8+bx] < 0.32) Dw.px(c, x, y, acc);
-    }
-    let py2 = wy + 4, px2 = wx + Math.floor(ww * 0.5);
-    for (const [dx, dy] of [[1,3],[-2,4],[2,5],[0,5],[1,3]]) {
-      for (let t = 0; t <= 1; t += 0.2)
-        Dw.px(c, Math.round(px2 + dx*t), Math.round(py2 + dy*t), acc);
-      px2 += dx; py2 += dy;
-    }
-    // interior brightens — accent dots scattered through the room
-    for (let i = 0; i < 24; i++) {
-      const ix = (i * 19) % W, iy = (i * 13) % floorY;
-      Dw.px(c, ix, iy, acc);
-    }
-  }
-  // rain streaks on window
-  for (let i = 0; i < 36; i++) {
-    const rx = wx + 2 + ((i * 5 + Math.floor(tick * 0.3)) % (ww - 4));
-    const ry = wy + 2 + ((i * 7 + Math.floor(tick * 0.6)) % (wh - 4));
-    Dw.px(c, rx, ry); Dw.px(c, rx, ry + 1);
-  }
-  // couch right of window
-  const cfX = Math.floor(W * 0.78), cfY = floorY - 14;
-  Dw.pxRect(c, cfX, cfY, 22, 10);
-  for (let x = 0; x <= 22; x++) Dw.px(c, cfX + x, cfY - 4);
-  for (let yy = -4; yy < 10; yy++) { Dw.px(c, cfX, cfY + yy); Dw.px(c, cfX + 22, cfY + yy); }
-  WS.drawPerson(c, cfX + 2, cfY - 8, 'boy', 'sit', 0);
-  WS.drawPerson(c, cfX + 14, cfY - 8, 'girl', 'sit', 0);
-  // CAT curled up BETWEEN them on the couch
-  const ccX = cfX + 11;
-  Dw.pxCircle(c, ccX, cfY + 2, 2, null, false);
-  Dw.px(c, ccX + 1, cfY); Dw.px(c, ccX + 2, cfY);
-  // floor lamp — flickers (off briefly during lightning)
-  const lmX = cfX - 6;
-  for (let dy = 0; dy < 16; dy++) Dw.px(c, lmX, floorY - 1 - dy);
-  Dw.pxRect(c, lmX - 3, floorY - 18, 7, 3);
-  if (!flashing) Dw.pxCircleDither(c, lmX, floorY - 14, 7, acc, () => 0.3);
-  // mug on side table + rising steam (warmth against the storm)
-  const mgX = cfX - 14;
-  Dw.pxRect(c, mgX, cfY + 4, 4, 4);
-  Dw.px(c, mgX + 1, cfY + 3, acc); Dw.px(c, mgX + 2, cfY + 3, acc);
-  for (let s = 0; s < 4; s++) {
-    const ph = ((tick * 0.05 + s * 8) % 16) / 16;
-    if (ph < 0.1) continue;
-    const sx = mgX + 1 + Math.floor(Math.sin(ph * Math.PI * 2 + s) * 2);
-    const sy = cfY + 3 - Math.floor(ph * 8);
-    Dw.px(c, sx, sy); Dw.px(c, sx + 1, sy);
-  }
-}
-
-function drawNightPanel(c, W, H, tick, hour) {
-  const acc = Dw.getAccent();
-  const groundY = H - Math.floor(H * 0.18);
-  const personY = groundY - 14;
-  // dark sky dither (denser at top)
-  for (let y = 0; y < groundY - 2; y++) {
-    for (let x = 0; x < W; x++) {
-      const bx = ((x % 8)+8)%8, by = ((y%8)+8)%8;
-      if (Dw.BAYER8[by*8+bx] < 0.36 - (y / Math.max(1,groundY)) * 0.22) Dw.px(c, x, y);
-    }
-  }
-  WS.starsField(c, W, 30, hour * 7);
-  Dw.drawMoon(c, Math.floor(W * 0.78), Math.floor(H * 0.22), 8, 0.4);
-  WS.skyline(c, 0, groundY - 4, W, 17);
-  // lit windows
-  for (let i = 0; i < 25; i++) {
-    const x = (i * 19) % W, y = groundY - 8 - ((i * 7) % 24);
-    if (i % 2 === 0) Dw.px(c, x, y, acc);
-  }
-  WS.ground(c, W, H, 'grass');
-  // tree with owl
-  const tx = Math.floor(W * 0.12);
-  for (let dy = 0; dy < 12; dy++) Dw.px(c, tx, groundY - 2 - dy);
-  Dw.pxCircle(c, tx, groundY - 16, 5, null, false);
-  Dw.pxRect(c, tx + 2, groundY - 14, 4, 4);
-  Dw.px(c, tx + 2, groundY - 14, acc); Dw.px(c, tx + 5, groundY - 14, acc);
-  // porch
-  for (let x = Math.floor(W * 0.42); x < Math.floor(W * 0.7); x++) {
-    Dw.px(c, x, groundY); Dw.px(c, x, groundY + 2);
-  }
-  // boy + girl looking up
-  WS.drawPerson(c, Math.floor(W * 0.5),  personY, 'boy', 'cheer', 0);
-  WS.drawPerson(c, Math.floor(W * 0.6),  personY, 'girl', 'cheer', 0);
-  // fireflies near them
-  for (let i = 0; i < 6; i++) {
-    const fx = Math.floor(Math.sin((tick + i * 100) * 0.02) * 30 + W * 0.55);
-    const fy = Math.floor(Math.cos((tick + i * 100) * 0.03) * 8 + personY - 4);
-    Dw.px(c, fx, fy, acc); Dw.px(c, fx + 1, fy, acc);
-  }
-  // shooting star
-  if (Math.floor(tick / 200) % 3 === 0 && (tick % 200) < 30) {
-    const t2 = (tick % 200) / 30;
-    const sx = Math.round(W * 0.2 + t2 * W * 0.4);
-    const sy = Math.round(20 + t2 * 10);
-    for (let d = 0; d < 6; d++) Dw.px(c, sx - d, sy - Math.floor(d/2), acc);
-  }
-}
-
-function ModeStoryboard({ timeline, dark, idx, setIdx }) {
-  return (
-    <div className="dw-story-grid" style={{
-      display: 'grid',
-      gridTemplateColumns: 'repeat(2, 1fr)',
-      gap: 18,
-    }}>
-      {timeline.slice(0, 8).map((t, i) => {
-        const kind = WS.codeToKind(t.code);
-        const isActive = i === idx;
-        return (
-          <button key={i} onClick={() => setIdx(i)} aria-label={`Scene ${i+1} ${t.label}`}
-            style={{
-              position: 'relative',
-              background: '#0a0907',
-              border: 'none',
-              boxShadow: isActive
-                ? '0 0 0 3px var(--rust), 8px 8px 0 var(--ink)'
-                : '0 0 0 2px var(--ink), 4px 4px 0 var(--ink)',
-              padding: 0,
-              cursor: 'pointer',
-              fontFamily: '"VT323", monospace',
-              color: '#f3ecd9',
-              textAlign: 'left',
-              transform: isActive ? 'translate(-2px,-2px)' : 'none',
-              transition: 'transform .18s, box-shadow .18s',
-              overflow: 'hidden',
-              display: 'flex', flexDirection: 'column',
-            }}>
-            {/* SLATE TOP */}
-            <div style={{
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              background: '#0a0907', color: '#f3ecd9',
-              padding: '8px 14px', fontSize: 14, letterSpacing: 2,
-              borderBottom: '2px dashed #3a3025',
-            }}>
-              <span style={{ display:'flex', gap: 8, alignItems:'center' }}>
-                <span style={{
-                  background: isActive ? 'var(--rust)' : '#2a221b',
-                  color: isActive ? '#0a0907' : '#f3ecd9',
-                  padding: '1px 8px', letterSpacing: 1, fontWeight: 'bold',
-                }}>SCENE {String(i+1).padStart(2,'0')}</span>
-                <span style={{ color:'#b89a7e' }}>· {String(t.hour).padStart(2,'0')}:00</span>
-              </span>
-              <span style={{ color: isActive ? 'var(--rust)' : '#b89a7e', letterSpacing: 1,
-                display:'flex', alignItems:'center', gap: 6 }}>
-                <span style={{ width: 8, height: 8, borderRadius: 0,
-                  background: isActive ? 'var(--rust)' : '#b89a7e',
-                  animation: isActive ? 'pulse 1.4s infinite' : 'none' }} />
-                {isActive ? 'NOW PLAYING' : t.label}
-              </span>
-            </div>
-
-            {/* CINEMASCOPE FRAME */}
-            <div style={{ position:'relative', background: 'var(--paper-2)' }}>
-              <PixCanvasAuto height={320} scale={4} maxLogicalW={200} minLogicalW={100}
-                deps={[kind, t.hour, dark, isActive]}
-                draw={(c, tick, W, H) => renderStoryPanel(c, W, H, tick, kind, t.hour, isActive)}
-              />
-              {/* letterbox bars */}
-              <div style={{ position:'absolute', top: 0, left: 0, right: 0, height: 18,
-                background: '#0a0907', pointerEvents:'none' }} />
-              <div style={{ position:'absolute', bottom: 0, left: 0, right: 0, height: 18,
-                background: '#0a0907', pointerEvents:'none' }} />
-              {/* film perforation dots */}
-              <div style={{ position:'absolute', top: 22, left: 6, display:'flex', flexDirection:'column', gap: 6, pointerEvents:'none' }}>
-                {[0,1,2,3].map(j => <div key={j} style={{ width: 6, height: 6, background:'#2a221b' }} />)}
-              </div>
-              <div style={{ position:'absolute', top: 22, right: 6, display:'flex', flexDirection:'column', gap: 6, pointerEvents:'none' }}>
-                {[0,1,2,3].map(j => <div key={j} style={{ width: 6, height: 6, background:'#2a221b' }} />)}
-              </div>
-              {/* burn-in timecode */}
-              <div style={{
-                position:'absolute', bottom: 22, left: 14, color:'#f3ecd9',
-                fontFamily:'"VT323",monospace', fontSize: 14, letterSpacing: 1,
-                textShadow:'1px 1px 0 #000', pointerEvents:'none',
-              }}>
-                {String(t.hour).padStart(2,'0')}:00:{String(Math.floor((i*7)%60)).padStart(2,'0')}
-              </div>
-              <div style={{
-                position:'absolute', bottom: 22, right: 14, color:'var(--rust)',
-                fontFamily:'"VT323",monospace', fontSize: 14, letterSpacing: 1,
-                textShadow:'1px 1px 0 #000', pointerEvents:'none',
-              }}>
-                {window.formatT(t.temp).replace('°','')}° · ☂{t.precipProb}%
-              </div>
-              {/* reel ID top-left */}
-              <div style={{
-                position:'absolute', top: 22, left: 22, color:'#b89a7e',
-                fontFamily:'"VT323",monospace', fontSize: 12, letterSpacing: 2,
-                textShadow:'1px 1px 0 #000', pointerEvents:'none',
-              }}>
-                REEL {String(i+1).padStart(2,'0')}/08 · {kind.toUpperCase().replace('-',' ')}
-              </div>
-            </div>
-
-            {/* SUBTITLE BAND */}
-            <div style={{
-              background: '#0a0907', color: '#f3ecd9', padding: '12px 16px',
-              fontFamily: '"Crimson Pro", serif', fontStyle:'italic',
-              fontSize: 17, lineHeight: 1.3, textAlign:'center',
-              borderTop: '2px dashed #3a3025',
-              textWrap: 'pretty', minHeight: 50,
-            }}>
-              "{storyCaption(kind, t.hour, t.temp)}"
-            </div>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function storyCaption(kind, hour, temp) {
-  const morn = hour < 11, noon = hour >= 11 && hour < 16, eve = hour >= 16 && hour < 20, night = hour >= 20 || hour < 5;
-  if (kind === 'sun')        return night ? 'A clear, starlit hour.' : (morn ? 'Sun gilds the eaves.' : (noon ? 'A perfect, brazen blue.' : 'Long gold across the meadow.'));
-  if (kind === 'sun-cloud')  return morn ? 'Clouds, with windows of sun.' : 'A scattering of fair weather.';
-  if (kind === 'cloud')      return 'A flat ceiling of grey.';
-  if (kind === 'fog')        return morn ? 'A hush; the world in cotton.' : 'Lanterns swallowed by mist.';
-  if (kind === 'rain')       return 'Rain drumming on every roof.';
-  if (kind === 'snow')       return 'White hush, settling slow.';
-  if (kind === 'storm')      return 'Heavens loose their cisterns.';
-  return 'The sky keeps its counsel.';
-}
-
-// ── reusable panel scene used by storyboard, diary, mandala center ──────
-function PanelScene({ kind, hour, dark, live = false, height = 100, includeChars = true }) {
-  return (
-    <PixCanvasAuto height={height} scale={4} maxLogicalW={140}
-      deps={[kind, hour, dark, live, includeChars]}
-      draw={(c, tick, W, H) => {
-        // simplified scene: sky + horizon + maybe characters
-        const groundY = H - Math.floor(H * 0.22);
-        // tinted sky band per hour
-        const night = hour >= 20 || hour < 5;
-        // far skyline
-        WS.skyline(c, 0, groundY - 4, W, 7 + hour);
-        // ground texture per kind
-        WS.ground(c, W, H, kind === 'snow' ? 'snow' : (['rain','storm','rainbow'].includes(kind) ? 'wet' : 'grass'));
-        // sky elements
-        const cx = Math.floor(W * 0.78), cy = Math.floor(H * 0.18);
-        if (kind === 'sun')        Dw.drawSun(c, cx, cy, 5, tick * 0.001);
-        else if (kind === 'sun-cloud') { Dw.drawSun(c, cx-2, cy, 4, tick*0.001); Dw.drawCloud(c, cx+4, cy+2, 10, 5); }
-        else if (kind === 'cloud') { Dw.drawCloud(c, cx-6, cy, 14, 6); Dw.drawCloud(c, Math.floor(W*0.25), cy+1, 12, 5); }
-        else if (kind === 'fog')   { Dw.drawCloud(c, cx-6, cy, 14, 6); WS.fogBands(c, W, H, tick); }
-        else if (kind === 'rain')  { Dw.drawCloud(c, cx-6, cy, 14, 6); Dw.drawCloud(c, Math.floor(W*0.25), cy+1, 12, 5); WS.rainParticles(c, W, H, tick, 0.8); }
-        else if (kind === 'snow')  { Dw.drawCloud(c, cx-6, cy, 14, 6); WS.snowParticles(c, W, H, tick); }
-        else if (kind === 'storm') { Dw.drawCloud(c, cx-6, cy, 14, 6); WS.rainParticles(c, W, H, tick, 1); WS.lightning(c, W, H, tick); }
-        // moon at night
-        if (night) {
-          Dw.drawMoon(c, Math.floor(W * 0.2), 8, 4, 0.4);
-          WS.starsField(c, W, 8, 99 + hour);
-        }
-        // tiny figures
-        if (includeChars) {
-          const f = Math.floor(tick / 12) % 2;
-          const bx = Math.floor(W * 0.42), gx = Math.floor(W * 0.55);
-          const py = groundY - 14;
-          if (kind === 'rain') {
-            WS.drawPerson(c, bx, py, 'boy', 'run', f);
-            WS.drawPerson(c, gx, py, 'girl', 'umbrella', 0);
-            WS.blit(c, gx-1, py-7, WS.PROPS.umbrella);
-          } else if (kind === 'snow') {
-            WS.drawPerson(c, bx, py, 'boy', 'idle', 0);
-            WS.drawPerson(c, gx + 8, py, 'girl', 'idle', 0);
-            WS.blit(c, Math.floor(W/2)-5, groundY-10, WS.PROPS.snowman);
-          } else if (kind === 'sun') {
-            WS.blit(c, bx-12, 4, WS.PROPS.kite);
-            WS.drawPerson(c, bx, py, 'boy', 'cheer', 0);
-            WS.drawPerson(c, gx, py, 'girl', 'idle', 0);
-          } else if (kind === 'fog') {
-            WS.drawPerson(c, bx+2, py, 'boy', 'walk', f);
-            WS.drawPerson(c, bx+10, py, 'girl', 'walk', f);
-          } else {
-            WS.drawPerson(c, bx, py, 'boy', live?'walk':'idle', f);
-            WS.drawPerson(c, gx, py, 'girl', live?'walk':'idle', (f+1)%2);
-          }
-        }
-      }}
-    />
-  );
-}
-
-// ── MODE B · GRAND DIORAMA (the existing one, kept) ───────────────────
-function ModeGrand({ timeline, dark, idx, setIdx, live }) {
-  // big scene canvas
-  return (
-    <div>
-      <PixCanvasAuto height={Math.min(620, 480)} scale={5} maxLogicalW={520}
-        deps={[timeline[idx]?.code, dark, live]}
-        draw={(c, tick, W, H) => {
-          const cur = timeline[idx];
-          if (!cur) return;
-          const kind = WS.codeToKind(cur.code);
-          WS.renderScene(c, W, H, tick, kind, 1000, null);
-        }}
-      />
-      <div style={{ display:'flex', gap: 12, justifyContent:'center', marginTop: 10,
-        fontFamily: '"VT323", monospace', flexWrap:'wrap' }}>
-        {timeline.map((t, i) => (
-          <button key={i} onClick={() => setIdx(i)} style={{
-            border: 'none', background: 'transparent', cursor: 'pointer',
-            fontFamily: '"VT323", monospace', fontSize: 18,
-            color: i === idx ? 'var(--rust)' : 'var(--slate)',
-            borderBottom: i === idx ? '2px solid var(--rust)' : 'none',
-            padding: '2px 6px',
-          }}>{t.label}</button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── MODE C · 24H MANDALA (clock-face astrolabe) ───────────────────────
-function ModeMandala({ timeline, dark, idx, setIdx }) {
-  const cur = timeline[idx] || timeline[0];
-  return (
-    <div className="dw-mandala-grid" style={{
-      display:'grid', gridTemplateColumns: '1fr', gap: 16, alignItems:'center',
-    }}>
-      <div style={{ position: 'relative', aspectRatio: '1 / 1', maxWidth: 720, margin: '0 auto', width:'100%' }}>
-        <PixCanvasAuto height={720} scale={5} maxLogicalW={144} minLogicalW={120}
-          deps={[timeline.length, idx, dark]}
-          draw={(c, tick, W, H) => {
-            const cx = Math.floor(W/2), cy = Math.floor(H/2);
-            const R = Math.min(cx, cy) - 4;
-            // outer dotted ring
-            for (let a = 0; a < Math.PI*2; a += 0.04) {
-              const x = Math.round(cx + Math.cos(a) * R);
-              const y = Math.round(cy + Math.sin(a) * R);
-              if (Math.floor(a*40) % 2 === 0) Dw.px(c, x, y);
-            }
-            // inner dotted ring
-            const Ri = R - 18;
-            for (let a = 0; a < Math.PI*2; a += 0.04) {
-              const x = Math.round(cx + Math.cos(a) * Ri);
-              const y = Math.round(cy + Math.sin(a) * Ri);
-              if (Math.floor(a*60) % 2 === 0) Dw.px(c, x, y);
-            }
-            // 24 hour ticks
-            for (let h = 0; h < 24; h++) {
-              const a = (h / 24) * Math.PI*2 - Math.PI/2;
-              for (let r = R - 2; r > R - 6; r--) {
-                const x = Math.round(cx + Math.cos(a) * r);
-                const y = Math.round(cy + Math.sin(a) * r);
-                Dw.px(c, x, y);
-              }
-              if (h % 6 === 0) {
-                for (let r = R - 6; r > R - 9; r--) {
-                  const x = Math.round(cx + Math.cos(a) * r);
-                  const y = Math.round(cy + Math.sin(a) * r);
-                  Dw.px(c, x, y, Dw.getAccent());
-                }
-              }
-            }
-            // sun arc (day) — accent dotted
-            const dayStart = 6, dayEnd = 19;
-            for (let h = dayStart; h <= dayEnd; h += 0.1) {
-              const a = (h/24) * Math.PI*2 - Math.PI/2;
-              const r = R - 11;
-              const x = Math.round(cx + Math.cos(a) * r);
-              const y = Math.round(cy + Math.sin(a) * r);
-              if (Math.floor(h*10) % 2 === 0) Dw.px(c, x, y, Dw.getAccent());
-            }
-            // night arc — ink dotted
-            for (let h = 19; h <= 30; h += 0.1) {
-              const hh = h % 24;
-              const a = (hh/24) * Math.PI*2 - Math.PI/2;
-              const r = R - 11;
-              const x = Math.round(cx + Math.cos(a) * r);
-              const y = Math.round(cy + Math.sin(a) * r);
-              if (Math.floor(h*10) % 2 === 0) Dw.px(c, x, y);
-            }
-            // hour glyph stations
-            timeline.forEach((t, i) => {
-              const a = (t.hour / 24) * Math.PI*2 - Math.PI/2;
-              const r = R - 14;
-              const x = Math.round(cx + Math.cos(a) * r);
-              const y = Math.round(cy + Math.sin(a) * r);
-              const kind = WS.codeToKind(t.code);
-              const sz = i === idx ? 5 : 3;
-              if (kind === 'sun')        Dw.drawSun(c, x, y, sz, tick * 0.001);
-              else if (kind === 'sun-cloud') Dw.drawCloud(c, x, y, sz+2, sz);
-              else if (kind === 'cloud') Dw.drawCloud(c, x, y, sz+2, sz);
-              else if (kind === 'fog')   { Dw.drawCloud(c, x, y, sz+2, sz); }
-              else if (kind === 'rain')  { Dw.drawCloud(c, x, y-1, sz+2, sz); for (let q = 0; q < 3; q++) Dw.px(c, x-1+q, y+sz, Dw.getAccent()); }
-              else if (kind === 'snow')  { Dw.drawCloud(c, x, y-1, sz+2, sz); for (let q = 0; q < 3; q++) Dw.px(c, x-1+q, y+sz); }
-              else if (kind === 'storm') { Dw.drawCloud(c, x, y-1, sz+2, sz); Dw.drawBolt(c, x, y+sz); }
-              else                       Dw.drawCloud(c, x, y, sz+2, sz);
-              if (i === idx) {
-                Dw.pxCircle(c, x, y, sz + 4, Dw.getAccent(), false);
-              }
-            });
-            // hour labels at cardinal hours via accent dots
-            const cardinal = [0, 6, 12, 18];
-            cardinal.forEach(h => {
-              const a = (h/24)*Math.PI*2 - Math.PI/2;
-              const r = R + 2;
-              const x = Math.round(cx + Math.cos(a) * r);
-              const y = Math.round(cy + Math.sin(a) * r);
-              Dw.px(c, x, y, Dw.getAccent());
-            });
-            // the "hand" — pointing to the current scene hour
-            if (cur) {
-              const a = (cur.hour / 24)*Math.PI*2 - Math.PI/2;
-              for (let r = 0; r < Ri - 16; r += 1) {
-                const x = Math.round(cx + Math.cos(a) * r);
-                const y = Math.round(cy + Math.sin(a) * r);
-                if (r % 3 !== 0) Dw.px(c, x, y, Dw.getAccent());
-              }
-              // arrow tip
-              const tipR = Ri - 16;
-              const tx = Math.round(cx + Math.cos(a) * tipR);
-              const ty = Math.round(cy + Math.sin(a) * tipR);
-              for (let dy = -2; dy <= 2; dy++)
-                for (let dx = -2; dx <= 2; dx++)
-                  if (Math.abs(dx)+Math.abs(dy)<=2) Dw.px(c, tx+dx, ty+dy, Dw.getAccent());
-            }
-            // Inner mini scene
-            const innerR = Math.floor(Ri * 0.75);
-            // mask: draw a small landscape inside the inner ring
-            const mw = innerR * 2 - 6, mh = innerR * 2 - 6;
-            const mx = cx - innerR + 3, my = cy - innerR + 3;
-            // sub-scene
-            const kind = cur ? WS.codeToKind(cur.code) : 'cloud';
-            // mini horizon
-            const groundY = my + Math.floor(mh * 0.7);
-            // simple sky
-            if (kind === 'sun') Dw.drawSun(c, mx + Math.floor(mw*0.7), my + 6, 5, tick*0.001);
-            else if (kind === 'rain') { Dw.drawCloud(c, mx + Math.floor(mw*0.5), my + 6, 12, 6); for (let q = 0; q < 14; q++) {
-              const px = mx + 4 + q*2; const py = my + 14 + ((Math.floor(tick) + q*5) % (mh - 18));
-              if (Math.hypot(px - cx, py - cy) < innerR - 4) Dw.px(c, px, py);
-            }}
-            else if (kind === 'snow') { Dw.drawCloud(c, mx + Math.floor(mw*0.5), my + 6, 12, 6); }
-            else Dw.drawCloud(c, mx + Math.floor(mw*0.6), my + 6, 12, 6);
-            // ground arc inside the circle
-            for (let x = -innerR + 4; x <= innerR - 4; x++) {
-              const yMax = Math.round(Math.sqrt(Math.max(0, (innerR-4)*(innerR-4) - x*x)));
-              const gy = Math.min(groundY, cy + yMax);
-              Dw.px(c, cx + x, gy);
-            }
-            // figures
-            const py = groundY - 14;
-            const f = Math.floor(tick/12) % 2;
-            if (kind === 'rain') {
-              WS.drawPerson(c, cx-4, py, 'boy', 'run', f);
-              WS.drawPerson(c, cx+6, py, 'girl', 'umbrella', 0);
-              WS.blit(c, cx+5, py-7, WS.PROPS.umbrella);
-            } else if (kind === 'sun') {
-              WS.drawPerson(c, cx-4, py, 'boy', 'cheer', 0);
-              WS.drawPerson(c, cx+6, py, 'girl', 'idle', 0);
-              WS.blit(c, cx-12, my + 6, WS.PROPS.kite);
-            } else {
-              WS.drawPerson(c, cx-4, py, 'boy', 'walk', f);
-              WS.drawPerson(c, cx+6, py, 'girl', 'walk', (f+1)%2);
-            }
-            // center label band
-            for (let x = cx - 18; x <= cx + 18; x++) Dw.px(c, x, cy + Math.floor(mh*0.05), Dw.getAccent());
-          }}
-        />
-        {/* clickable hotspots overlaid on hour stations */}
-        <div style={{ position:'absolute', inset: 0, pointerEvents:'none' }}>
-          {timeline.map((t, i) => {
-            const a = (t.hour / 24) * 360 - 90;
-            const rad = a * Math.PI / 180;
-            const r = 0.42; // ~ relative to half
-            const x = 50 + Math.cos(rad) * 100 * r;
-            const y = 50 + Math.sin(rad) * 100 * r;
-            return (
-              <button key={i} onClick={() => setIdx(i)}
-                style={{
-                  position:'absolute', left:`${x}%`, top:`${y}%`,
-                  width: 44, height: 44, transform: 'translate(-50%,-50%)',
-                  background: 'transparent', border: 'none', cursor: 'pointer',
-                  pointerEvents: 'auto',
-                }}
-                aria-label={t.label} title={t.label}
-              />
-            );
-          })}
-        </div>
-      </div>
-      {/* Reading panel beneath */}
-      <div style={{
-        margin: '0 auto', maxWidth: 640, textAlign: 'center',
-        fontFamily: '"VT323", monospace',
-      }}>
-        <div style={{ fontSize: 14, letterSpacing: 3, color: 'var(--slate)' }}>HOUR {String(cur?.hour ?? 0).padStart(2,'0')}:00</div>
-        <div style={{ fontSize: 30, color: 'var(--rust)', letterSpacing: 1 }}>{cur?.label}</div>
-        <div style={{ fontFamily: '"Crimson Pro", serif', fontStyle:'italic', fontSize: 18, marginTop: 4 }}>
-          {WS.KIND_LABEL[WS.codeToKind(cur?.code)] || ''}
-        </div>
-        <div style={{ marginTop: 6, fontSize: 18, display:'flex', justifyContent:'center', gap: 18 }}>
-          <span style={{ color:'var(--rust)' }}>{window.formatT(cur?.temp)}</span>
-          <span>☂{cur?.precipProb}%</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── MODE D · ALMANAC DIARY (taped polaroids on a journal page) ───────
-function ModeDiary({ timeline, dark, idx, setIdx, dateLabel }) {
-  // 6 scattered "polaroids" with rotations + tape
-  const positions = [
-    { left: '4%',  top: 0,    rot: -3, scale: 1 },
-    { left: '34%', top: 30,   rot: 2,  scale: 1.05 },
-    { left: '64%', top: 0,    rot: -2, scale: 1 },
-    { left: '8%',  top: 280,  rot: 4,  scale: 1 },
-    { left: '38%', top: 310,  rot: -2, scale: 1.05 },
-    { left: '68%', top: 290,  rot: 3,  scale: 1 },
-  ];
-  const items = timeline.slice(0, 6);
-  return (
-    <div>
-      <div style={{
-        position: 'relative',
-        background: 'var(--paper)',
-        border: '1px solid var(--ink)',
-        boxShadow: 'inset 0 0 0 4px var(--paper), inset 0 0 0 5px var(--ink)',
-        padding: '24px 28px 40px',
-        minHeight: 660,
-        backgroundImage: 'repeating-linear-gradient(transparent 0 26px, color-mix(in srgb, var(--ink) 12%, transparent) 26px 27px)',
-        backgroundPosition: '0 8px',
-      }}>
-        {/* margin red line */}
-        <div style={{ position:'absolute', left: 60, top: 0, bottom: 0, width: 1,
-          background: 'var(--rust)', opacity: .55 }} />
-        {/* hand-written header */}
-        <div style={{
-          fontFamily: '"VT323", monospace', fontSize: 18, color: 'var(--rust)',
-          letterSpacing: 1, paddingLeft: 80, marginBottom: 6,
-        }}>
-          ❒ ENTRY · {dateLabel} ❒
-        </div>
-        <div style={{
-          fontFamily: '"Crimson Pro", serif', fontStyle:'italic', fontSize: 18,
-          paddingLeft: 80, marginBottom: 16, color: 'var(--ink)', maxWidth: 540,
-        }}>
-          Notes from the day, taped in along the way — clip them to enlarge.
-        </div>
-
-        {/* polaroids */}
-        <div style={{ position:'relative', height: 560 }}>
-          {items.map((t, i) => {
-            const p = positions[i] || positions[0];
-            const kind = WS.codeToKind(t.code);
-            const isActive = i === idx;
-            return (
-              <button key={i} onClick={() => setIdx(i)}
-                style={{
-                  position: 'absolute',
-                  left: p.left,
-                  top: p.top,
-                  width: 230,
-                  transform: `rotate(${p.rot}deg) scale(${isActive ? p.scale * 1.06 : p.scale})`,
-                  transition: 'transform .25s, box-shadow .25s',
-                  background: 'var(--paper-2)',
-                  border: '1px solid var(--ink)',
-                  boxShadow: isActive ? '6px 8px 0 var(--rust), 0 0 0 1px var(--ink)' : '4px 6px 0 color-mix(in srgb, var(--ink) 50%, transparent)',
-                  padding: 8,
-                  cursor: 'pointer',
-                  fontFamily: '"VT323", monospace',
-                  color: 'var(--ink)',
-                  zIndex: isActive ? 10 : 2,
-                  textAlign: 'left',
-                }}>
-                {/* tape */}
-                <div style={{
-                  position:'absolute', top: -10, left: '40%', width: 56, height: 18,
-                  background: 'color-mix(in srgb, var(--rust) 30%, var(--paper))',
-                  border: '1px dashed color-mix(in srgb, var(--ink) 35%, transparent)',
-                  transform: `rotate(${(i%2?-6:8)}deg)`, opacity: .85,
-                }} />
-                <PanelScene kind={kind} hour={t.hour} dark={dark} live={isActive} height={130} includeChars />
-                <div style={{
-                  marginTop: 6, fontFamily: '"Caveat", "Crimson Pro", cursive', fontStyle:'italic',
-                  fontSize: 16, lineHeight: 1.15, textWrap: 'pretty',
-                }}>
-                  <span style={{ color: 'var(--rust)' }}>{t.label}</span> — {storyCaption(kind, t.hour, t.temp)}
-                </div>
-                <div style={{ display:'flex', justifyContent:'space-between',
-                  fontSize: 14, marginTop: 4, color: 'var(--slate)' }}>
-                  <span>{String(t.hour).padStart(2,'0')}:00</span>
-                  <span style={{ color:'var(--rust)' }}>{window.formatT(t.temp)}</span>
-                  <span>☂{t.precipProb}%</span>
-                </div>
-              </button>
-            );
-          })}
-          {/* corner doodle */}
-          <div style={{
-            position:'absolute', right: 12, bottom: 8,
-            fontFamily: '"VT323", monospace', fontSize: 14, color: 'var(--slate)',
-            letterSpacing: 2,
-          }}>~ pp. {Math.floor(Math.random()*40)+24} ~</div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── MODE E · ATMOSPHERIC RIBBON (panorama strip + dataline) ─────────
-function ModeRibbon({ timeline, dark, idx, setIdx, s }) {
-  // Build temperature curve for 24 hours
-  const hours24 = (s.hourly || []).slice(0, 24);
-  const temps = hours24.map(h => h.temp ?? 0);
-  const precip = hours24.map(h => h.precipProb ?? 0);
-  const tMin = Math.min(...temps, 0), tMax = Math.max(...temps, 1);
-
-  return (
-    <div>
-      {/* Temperature + precip ribbon at top */}
-      <PixCanvasAuto height={140} scale={4} maxLogicalW={520}
-        deps={[temps.join(','), precip.join(','), idx, dark]}
-        draw={(c, tick, W, H) => {
-          // dotted h-grid
-          for (let yy = 6; yy < H - 14; yy += 8)
-            for (let x = 0; x < W; x += 4) Dw.px(c, x, yy);
-          // baseline
-          for (let x = 0; x < W; x++) Dw.px(c, x, H - 14);
-          // temperature line — dotted curve
-          if (temps.length > 1) {
-            const range = Math.max(1, tMax - tMin);
-            for (let i = 0; i < W; i++) {
-              const t = (i / (W-1)) * (temps.length - 1);
-              const i0 = Math.floor(t), i1 = Math.min(temps.length-1, i0+1);
-              const f = t - i0;
-              const v = temps[i0] * (1-f) + temps[i1] * f;
-              const y = Math.round((H - 18) - ((v - tMin) / range) * (H - 28));
-              if (i % 2 === 0) Dw.px(c, i, y, Dw.getAccent());
-              if (i % 3 === 0) Dw.px(c, i, y+1, Dw.getAccent());
-              // shading drop
-              for (let yy = y+2; yy < H - 14; yy += 3) {
-                const bx = ((i % 8) + 8) % 8, by = ((yy % 8) + 8) % 8;
-                if (Dw.BAYER8[by*8+bx] < 0.25) Dw.px(c, i, yy, Dw.getAccent());
-              }
-            }
-          }
-          // precip bars below baseline
-          for (let i = 0; i < W; i++) {
-            const t = (i / (W-1)) * (precip.length - 1);
-            const v = precip[Math.round(t)] || 0;
-            const h = Math.round((v / 100) * 10);
-            for (let dy = 0; dy < h; dy++) Dw.px(c, i, H - 13 + dy);
-          }
-          // current hour marker
-          const cur = timeline[idx];
-          if (cur) {
-            const x = Math.floor((cur.hour / 23) * (W - 1));
-            for (let yy = 2; yy < H - 14; yy += 1) Dw.px(c, x, yy, Dw.getAccent());
-          }
-          // hour ticks
-          for (let h = 0; h <= 24; h += 3) {
-            const x = Math.floor((h / 24) * (W - 1));
-            Dw.px(c, x, H - 13); Dw.px(c, x, H - 12); Dw.px(c, x, H - 11);
-          }
-        }}
-      />
-      {/* small labels under ribbon */}
-      <div style={{ display:'flex', justifyContent:'space-between',
-        fontFamily:'"VT323",monospace', fontSize: 13, letterSpacing: 1,
-        color:'var(--slate)', marginTop: 2, marginBottom: 18, padding:'0 4px' }}>
-        <span>00h</span><span>06h</span><span>12h</span><span>18h</span><span>24h</span>
-      </div>
-
-      {/* Panorama: long horizontal strip showing the day as one continuous painting */}
-      <div style={{ overflow:'hidden', border:'1px solid var(--ink)', position:'relative' }}>
-        <PixCanvasAuto height={260} scale={4} maxLogicalW={520}
-          deps={[timeline.length, idx, dark]}
-          draw={(c, tick, W, H) => {
-            // sun arc spanning whole width
-            const sunRiseFrac = 0.25, sunSetFrac = 0.83;
-            // sky gradient via dither — darker at edges, lighter at noon
-            for (let x = 0; x < W; x++) {
-              const t = x / W;
-              const dayT = Math.max(0, Math.min(1, (t - sunRiseFrac) / (sunSetFrac - sunRiseFrac)));
-              const brightness = Math.sin(dayT * Math.PI); // 0 at edges, 1 at noon
-              for (let y = 0; y < H - 30; y++) {
-                const bx = ((x % 8) + 8) % 8, by = ((y % 8) + 8) % 8;
-                const top = y / (H - 30);
-                const dark = (1 - brightness) * 0.5 + top * 0.4;
-                if (Dw.BAYER8[by*8+bx] < dark * 0.6) Dw.px(c, x, y);
-              }
-            }
-            // sun/moon arc
-            for (let t = 0; t <= 1; t += 1/W) {
-              const x = Math.round(t * (W-1));
-              const a = t * Math.PI;
-              const y = Math.round((H - 38) - Math.sin(a) * (H - 50));
-              if (Math.floor(t * 80) % 2 === 0) {
-                Dw.px(c, x, y, t > sunRiseFrac && t < sunSetFrac ? Dw.getAccent() : null);
-              }
-            }
-            // sun position based on idx hour
-            const cur = timeline[idx];
-            const hourFrac = (cur?.hour ?? 12) / 24;
-            const sx = Math.round(hourFrac * (W-1));
-            const ay = Math.round((H - 38) - Math.sin(hourFrac * Math.PI) * (H - 50));
-            if (hourFrac > 0.22 && hourFrac < 0.85) Dw.drawSun(c, sx, ay, 5, tick*0.001);
-            else Dw.drawMoon(c, sx, Math.max(8, ay), 5, 0.4);
-
-            // far skyline
-            const groundY = H - 22;
-            WS.skyline(c, 0, groundY - 4, W, 13);
-            WS.ground(c, W, H, 'grass');
-            // mid trees + houses
-            WS.distantTree(c, Math.floor(W*0.06), groundY-6);
-            WS.distantTree(c, Math.floor(W*0.12), groundY-5);
-            WS.distantHouse(c, Math.floor(W*0.4), groundY-6);
-            WS.bigTree(c, Math.floor(W*0.92), groundY-2);
-            // poles + wires
-            const poles = [Math.floor(W*0.06), Math.floor(W*0.32), Math.floor(W*0.68), Math.floor(W*0.96)];
-            for (const px of poles) WS.telephonePole(c, px, groundY);
-            for (let i = 0; i < poles.length-1; i++) WS.wireBetween(c, poles[i], poles[i+1], groundY-22, 4);
-
-            // Vignettes — one per timeline entry, positioned along the strip
-            const f = Math.floor(tick/12) % 2;
-            timeline.slice(0, 8).forEach((t, i) => {
-              const x = Math.floor(((t.hour) / 24) * (W - 16)) + 8;
-              const py = groundY - 14;
-              const kind = WS.codeToKind(t.code);
-              const isCur = i === idx;
-              // marker post + flag
-              for (let yy = 0; yy < 16; yy++) Dw.px(c, x + 18, py + yy);
-              if (isCur) {
-                for (let yy = 0; yy < 5; yy++) for (let xx = 0; xx < 6; xx++)
-                  Dw.px(c, x + 19 + xx, py + yy, Dw.getAccent());
-              } else {
-                for (let yy = 0; yy < 4; yy++) for (let xx = 0; xx < 5; xx++)
-                  Dw.px(c, x + 19 + xx, py + yy);
-              }
-              // mini scene per kind near the post
-              if (kind === 'rain') {
-                WS.drawPerson(c, x, py, 'boy', isCur?'run':'walk', f);
-                WS.drawPerson(c, x+10, py, 'girl', 'umbrella', 0);
-                WS.blit(c, x+9, py-7, WS.PROPS.umbrella);
-              } else if (kind === 'snow') {
-                WS.drawPerson(c, x, py, 'boy', 'idle', 0);
-                WS.blit(c, x-8, groundY-10, WS.PROPS.snowman);
-              } else if (kind === 'sun') {
-                WS.drawPerson(c, x, py, 'boy', isCur?'cheer':'walk', f);
-                WS.drawPerson(c, x+10, py, 'girl', 'idle', 0);
-              } else if (kind === 'fog') {
-                WS.fogBands(c, W, H, tick);
-                WS.drawPerson(c, x, py, 'boy', 'walk', f);
-                WS.drawPerson(c, x+10, py, 'girl', 'walk', f);
-              } else {
-                WS.drawPerson(c, x, py, 'boy', 'walk', f);
-                WS.drawPerson(c, x+10, py, 'girl', 'walk', (f+1)%2);
-              }
-              if (isCur) {
-                Dw.pxCircle(c, x+5, py+7, 14, Dw.getAccent(), false);
-              }
-            });
-
-            // overlay rain particles if any timeline-now is rain
-            const cur2 = timeline[idx];
-            if (cur2) {
-              const k = WS.codeToKind(cur2.code);
-              if (k === 'rain' || k === 'storm') WS.rainParticles(c, W, H, tick, 0.6);
-              if (k === 'snow') WS.snowParticles(c, W, H, tick);
-            }
-          }}
-        />
-      </div>
-
-      {/* Hour buttons */}
-      <div style={{ display:'flex', justifyContent:'space-between', marginTop: 10,
-        fontFamily:'"VT323",monospace', flexWrap:'wrap', gap: 4 }}>
-        {timeline.map((t, i) => (
-          <button key={i} onClick={() => setIdx(i)}
-            style={{
-              flex: '1 1 0',
-              border: 'none', background:'transparent', cursor:'pointer',
-              fontFamily: '"VT323", monospace', fontSize: 16,
-              color: i === idx ? 'var(--rust)' : 'var(--slate)',
-              borderTop: i === idx ? '2px solid var(--rust)' : '1px dotted var(--ink)',
-              padding: '4px 2px',
-            }}>
-            <div>{t.label}</div>
-            <div style={{ fontSize: 14, color: i === idx ? 'var(--rust)' : 'var(--ink)' }}>{window.formatT(t.temp)}</div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── MODE WRAPPER + SWITCHER ────────────────────────────────────────
-const MODES = [
-  { id:'storyboard', label:'STORYBOARD', sub:'Comic of the day',     glyph:'▦' },
-  { id:'grand',      label:'DIORAMA',    sub:'One stage, all hours', glyph:'◘' },
-  { id:'mandala',    label:'MANDALA',    sub:'24-hour astrolabe',    glyph:'☉' },
-  { id:'diary',      label:'DIARY',      sub:'Journal w/ polaroids', glyph:'❒' },
-  { id:'ribbon',     label:'RIBBON',     sub:'Panorama + dataline',  glyph:'≋' },
-];
-
-function DayInWeather({ s, dark }) {
-  const [dayIdx, setDayIdx] = useState(0);
-  const [mode, setMode] = useState('storyboard');
-  const [idx, setIdx] = useState(0);
-  const [auto, setAuto] = useState(true);
-
-  const timeline = useTimeline(s, dayIdx);
-
-  // auto-advance scene
-  useEffect(() => {
-    if (!auto || !timeline.length) return;
-    const id = setInterval(() => setIdx(i => (i+1) % timeline.length), 5500);
-    return () => clearInterval(id);
-  }, [auto, timeline.length]);
-
-  // bound idx
-  useEffect(() => { if (idx >= timeline.length) setIdx(0); }, [timeline.length, idx]);
-
-  if (!timeline.length) return null;
-  const cur = timeline[idx] || timeline[0];
-  const dateLabel = (s.daily?.[dayIdx]?.date || new Date()).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  // Hour readout
+  const hour = (t / DAY_SECONDS) * 24;
+  const hh = Math.floor(hour) % 24;
+  const mm = Math.floor((hour % 1) * 60);
+  const hourStr = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+  const today = (s.daily || [])[dayIdx] || {};
+  const dayLabel = today.date
+    ? today.date.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase()
+    : 'TODAY';
 
   return (
     <section className="pad-section" style={{ padding: '36px 28px 28px', position:'relative',
-      background: 'var(--paper)', borderTop: '4px double var(--ink)' }}>
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-        marginBottom: 6, fontFamily: '"VT323", monospace', fontSize: 14, letterSpacing: 2,
-        color: 'var(--slate)' }}>
-        <span>FIG. III · A LIFE IN THE FORECAST</span>
-        <span>MODE · {MODES.find(m=>m.id===mode)?.label}</span>
-      </div>
-      <h2 style={{ fontFamily: '"VT323", monospace', fontSize: 'clamp(40px, 6vw, 80px)',
-        color: 'var(--rust)', margin: 0, lineHeight: 1, letterSpacing: 3,
-        textAlign: 'center', textShadow: '3px 3px 0 color-mix(in srgb, var(--ink) 18%, transparent)' }}>
-        ─── A DAY IN THE WEATHER ───
-      </h2>
-      <div style={{ textAlign:'center', fontStyle:'italic', fontSize: 18, marginTop: 4, marginBottom: 14 }}>
-        Five readings of the same day · {dateLabel}
-      </div>
+      borderTop:'4px double var(--ink)', background:'var(--paper)' }}>
+      <div className="stipple-bg" />
 
-      {/* MODE SWITCHER */}
-      <div style={{
-        display:'grid',
-        gridTemplateColumns:'repeat(5, 1fr)',
-        gap: 8,
-        margin:'0 auto 14px', maxWidth: 920,
-      }} className="dw-mode-switcher">
-        {MODES.map(m => {
-          const active = m.id === mode;
-          return (
-            <button key={m.id} onClick={() => { setMode(m.id); setIdx(0); }}
-              style={{
-                fontFamily:'"VT323", monospace',
-                background: active ? 'var(--rust)' : 'var(--paper-2)',
-                color: active ? 'var(--paper)' : 'var(--ink)',
-                border: '2px solid var(--ink)',
-                boxShadow: active ? '4px 4px 0 var(--ink)' : '2px 2px 0 var(--ink)',
-                padding: '8px 10px',
-                letterSpacing: 1,
-                cursor: 'pointer',
-                textAlign:'left',
-                transform: active ? 'translate(-1px,-1px)' : 'none',
-                transition: 'transform .12s, box-shadow .12s, background .15s',
-              }}>
-              <div style={{ display:'flex', alignItems:'center', gap: 6 }}>
-                <span style={{ fontSize: 22, lineHeight: 1 }}>{m.glyph}</span>
-                <span style={{ fontSize: 18, lineHeight: 1 }}>{m.label}</span>
-              </div>
-              <div style={{ fontSize: 13, opacity: .8, marginTop: 2 }}>{m.sub}</div>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* DAY + AUTOPLAY ROW */}
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-        flexWrap:'wrap', gap: 10, borderTop:'1px dashed var(--ink)', borderBottom:'1px dashed var(--ink)',
-        padding: '6px 4px', marginBottom: 14 }}>
-        <div style={{ display:'flex', flexWrap:'wrap', gap: 0 }}>
-          {(s.daily || []).slice(0, 7).map((d, i) => (
-            <button key={i} onClick={() => { setDayIdx(i); setIdx(0); }}
-              style={{
-                fontFamily: '"VT323", monospace', fontSize: 16, letterSpacing: 1,
-                border: 'none', borderRight: i < 6 ? '1px dotted var(--ink)' : 'none',
-                background: 'transparent',
-                color: i === dayIdx ? 'var(--rust)' : 'var(--ink)',
-                padding: '4px 12px', cursor: 'pointer',
-                textDecoration: i === dayIdx ? 'underline' : 'none',
-                fontWeight: i === dayIdx ? 'bold' : 'normal',
-              }}>
-              {i === 0 ? 'TODAY' : d.date.toLocaleDateString('en-US',{weekday:'short'}).toUpperCase()}
-            </button>
-          ))}
+      <div style={{ position:'relative', zIndex:1, maxWidth: 1200, margin: '0 auto' }}>
+        {/* Section header */}
+        <div style={{ display:'flex', alignItems:'baseline', justifyContent:'space-between',
+          fontFamily:'"VT323", monospace', fontSize: 14, letterSpacing: 2, color: 'var(--slate)',
+          marginBottom: 6 }}>
+          <span>FIG. III · A LIFE IN THE FORECAST</span>
+          <span>{hourStr}  ·  {dayLabel}</span>
         </div>
-        <button onClick={() => setAuto(a => !a)}
-          style={{
-            fontFamily:'"VT323",monospace', fontSize: 16, letterSpacing: 1,
-            border:'2px solid var(--ink)', background: auto ? 'var(--ink)' : 'var(--paper)',
-            color: auto ? 'var(--paper)' : 'var(--ink)',
-            padding:'2px 12px', cursor:'pointer', boxShadow:'2px 2px 0 var(--ink)',
-          }}>
-          {auto ? '❚❚ AUTOPLAY ON' : '▶ AUTOPLAY OFF'}
-        </button>
-      </div>
+        <h2 style={{ fontFamily:'"VT323", monospace', fontSize:'clamp(40px, 6vw, 80px)',
+          color:'var(--rust)', margin: 0, lineHeight: 1, letterSpacing: 3, textAlign: 'center',
+          textShadow: '3px 3px 0 color-mix(in srgb, var(--ink) 18%, transparent)' }}>
+          ─── A DAY IN THE WEATHER ───
+        </h2>
+        <div style={{ textAlign:'center', fontStyle:'italic', fontSize: 18, marginTop: 4, marginBottom: 18 }}>
+          A cabin on the cliff. One figure. The weather, all day.
+        </div>
 
-      {/* MODE BODY */}
-      <div style={{ minHeight: 320 }}>
-        {mode === 'storyboard' && <ModeStoryboard timeline={timeline} dark={dark} idx={idx} setIdx={setIdx} />}
-        {mode === 'grand'      && <ModeGrand      timeline={timeline} dark={dark} idx={idx} setIdx={setIdx} live={auto} />}
-        {mode === 'mandala'    && <ModeMandala    timeline={timeline} dark={dark} idx={idx} setIdx={setIdx} />}
-        {mode === 'diary'      && <ModeDiary      timeline={timeline} dark={dark} idx={idx} setIdx={setIdx} dateLabel={dateLabel} />}
-        {mode === 'ribbon'     && <ModeRibbon     timeline={timeline} dark={dark} idx={idx} setIdx={setIdx} s={s} />}
-      </div>
+        {/* The diorama */}
+        <div ref={containerRef} style={{
+          position:'relative', width: '100%', maxWidth: 1280, margin: '0 auto',
+          border: '2px solid var(--ink)', boxShadow: '8px 8px 0 var(--ink)',
+          background: '#000', overflow:'hidden',
+        }}>
+          <canvas ref={visRef} style={{ display:'block', imageRendering:'pixelated' }} />
+          {/* CSS vignette — focuses the eye on the cabin, free GPU-side cost */}
+          <div style={{ position:'absolute', inset: 0, pointerEvents:'none',
+            background: 'radial-gradient(ellipse 75% 75% at 50% 55%, transparent 60%, rgba(0,0,0,0.55) 100%)' }} />
 
-      {/* Caption strip */}
-      <div style={{ display:'flex', justifyContent:'space-between',
-        fontFamily:'"VT323",monospace', fontSize: 18, padding:'8px 6px 0',
-        borderTop:'1px dotted var(--ink)', marginTop: 14 }}>
-        <span style={{ color:'var(--slate)' }}>{cur.label}</span>
-        <span style={{ fontStyle:'italic', color:'var(--ink)', textAlign:'center', flex: 1 }}>
-          {WS.KIND_LABEL[WS.codeToKind(cur.code)] || ''}
-        </span>
-        <span style={{ color:'var(--rust)' }}>{window.formatT(cur.temp)} · {cur.precipProb}%☂</span>
-      </div>
+          {/* Top-bar overlay — minimal: hour, weather, shot */}
+          <div style={{ position:'absolute', top: 10, left: 12, right: 12, display:'flex',
+            justifyContent: 'space-between', alignItems: 'center', pointerEvents:'none',
+            fontFamily: '"VT323",monospace', fontSize: 14, letterSpacing: 2,
+            color: 'rgba(243,236,217,0.85)', textShadow:'1px 1px 0 #000' }}>
+            <span>{hourStr}</span>
+            <span style={{ opacity: 0.6 }}>{(L.codeToKind(dayForecast.codesByHour[hh]) || '').toUpperCase()}</span>
+            <span style={{ opacity: 0.6 }}>SHOT · {shotLabel}</span>
+          </div>
 
-      <div style={{ marginTop: 16, textAlign:'center', fontFamily:'"VT323",monospace',
-        fontSize: 14, letterSpacing: 6, color:'var(--slate)' }}>
-        ☼ ☾ ★ ☄ ✦ ☼ ☾ ★ ☄ ✦ ☼ ☾ ★ ☄ ✦
+          {/* Bottom-right corner — credit (matches the lo-fi reference) */}
+          <div style={{ position:'absolute', bottom: 10, right: 14, pointerEvents:'none',
+            fontFamily:'"VT323",monospace', fontSize: 13, color:'rgba(243,236,217,0.6)',
+            textShadow:'1px 1px 0 #000', letterSpacing: 1 }}>
+            ♪ — wind on water · saint mose
+          </div>
+
+          {/* Center play indicator on pause */}
+          {!playing && (
+            <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
+              justifyContent:'center', pointerEvents:'none' }}>
+              <div style={{ background:'rgba(0,0,0,0.5)', color:'#f3ecd9',
+                fontFamily:'"VT323",monospace', fontSize: 28, letterSpacing: 4,
+                padding: '12px 20px', border:'1px solid #f3ecd9' }}>‖ PAUSED</div>
+            </div>
+          )}
+        </div>
+
+        {/* Minimal controls */}
+        <div style={{ marginTop: 14, display:'flex', alignItems:'center', justifyContent:'center',
+          gap: 14, flexWrap:'wrap' }}>
+          <button onClick={() => setPlaying(p => !p)}
+            style={{ fontFamily:'"VT323",monospace', fontSize: 18, letterSpacing: 1,
+              border:'2px solid var(--ink)', background: playing ? 'var(--ink)' : 'var(--paper)',
+              color: playing ? 'var(--paper)' : 'var(--ink)', padding:'4px 16px',
+              cursor:'pointer', boxShadow:'2px 2px 0 var(--ink)' }}>
+            {playing ? '❚❚ PAUSE' : '▶ PLAY'}
+          </button>
+          <select value={dayIdx} onChange={e => setDayIdx(parseInt(e.target.value, 10))}
+            style={{ fontFamily:'"VT323",monospace', fontSize: 18, letterSpacing: 1,
+              border:'2px solid var(--ink)', background:'var(--paper)', color:'var(--ink)',
+              padding:'4px 12px', cursor:'pointer', boxShadow:'2px 2px 0 var(--ink)' }}>
+            {(s.daily || []).slice(0, 7).map((d, i) => (
+              <option key={i} value={i}>
+                {i === 0 ? 'TODAY' : d.date.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase()}
+                {' · '}{d.wmo.label}
+              </option>
+            ))}
+          </select>
+          <button onClick={() => setMuted(m => !m)}
+            style={{ fontFamily:'"VT323",monospace', fontSize: 18, letterSpacing: 1,
+              border:'2px solid var(--ink)', background:'var(--paper)', color:'var(--ink)',
+              padding:'4px 16px', cursor:'pointer', boxShadow:'2px 2px 0 var(--ink)',
+              opacity: 0.6 }} title="Audio loops not bundled in this build">
+            {muted ? '🔇 MUTE' : '🔊 SOUND'}
+          </button>
+        </div>
+
+        {/* Caption */}
+        <div style={{ marginTop: 14, textAlign:'center', fontStyle:'italic', fontSize: 17,
+          maxWidth: 720, margin: '14px auto 0', color: 'var(--ink)' }}>
+          {captionFor(L.codeToKind(dayForecast.codesByHour[hh]), hh)}
+        </div>
       </div>
     </section>
   );
 }
 
-window.DayInWeather = DayInWeather;
+function captionFor(kind, hour) {
+  const night = hour >= 21 || hour <= 5;
+  if (night && kind === 'storm') return 'The storm runs the headland. The figure stays at the door.';
+  if (kind === 'storm')      return 'Wind shears the pines. The lighthouse swings and finds nothing.';
+  if (kind === 'heavy-rain') return 'Sheeting rain. The sea is leaden. Water rolls off the gutter in a single rope.';
+  if (kind === 'rain')       return 'Rain slants across the cliff. The figure walks slowly, hat low.';
+  if (kind === 'fog')        return 'Fog walks in off the water. The lighthouse beam cuts a path.';
+  if (kind === 'snow')       return 'Snow drifts in eddies. The window holds the only warmth.';
+  if (kind === 'overcast')   return 'A leaden ceiling. The sea is the same color as the sky.';
+  if (kind === 'partly')     return 'Cloud-shadows pass across the cliff. The figure walks on.';
+  if (night)                  return 'The lighthouse blinks at distance. Stars hold their breath.';
+  return 'Crisp air. Distant sails. The figure walks the path to the bench.';
+}
+
+window.DayInWeather = CinemaDiorama;
